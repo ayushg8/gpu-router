@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gpu-router": {
+      "command": "gpu",
+      "args": ["mcp"]
+    }
+  }
+}

@@ -1,0 +1,48 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.bak
+*.orig
+*.swp
+*~
+
+# gpu-router runtime state (lives in GPU_ROUTER_HOME, never in the repo)
+gpu.db
+gpu.db-*
+daemon.token
+daemon.json
+daemon.lock
+state.json
+runs/
+# local data dirs (a GPU_ROUTER_HOME or job outputs pointed inside the checkout)
+.gpu-router/
+gpu-router-data/
+outputs/
+
+# Credentials: never commit any of these
+.env
+.env.*
+kaggle.json
+*.pem
+*.key
+.modal.toml
+*.token
+credentials.json
+application_default_credentials.json
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/

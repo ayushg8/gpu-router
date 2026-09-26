@@ -1,0 +1,127 @@
+[project]
+name = "gpu-router"
+version = "0.1.0"
+description = "Routes GPU jobs across free-tier cloud providers behind one local daemon."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "ayushg8" }]
+keywords = ["gpu", "kaggle", "colab", "lightning", "mcp", "claude-code", "free-tier"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Provider SDKs (kaggle, modal, lightning-sdk, google-colab-cli) are deliberately NOT
+# dependencies. Adapters shell out to CLIs installed in isolated tool envs with
+# `uv tool install <pkg>` (see CLAUDE.md, Decisions log D3).
+dependencies = [
+    "fastapi>=0.141,<1",
+    "uvicorn>=0.53,<1",
+    "pydantic>=2.13,<3",
+    "httpx>=0.28,<1",
+    "typer>=0.27,<1",
+    "rich>=15,<16",
+    "textual>=8.2,<9",
+    "pyyaml>=6.0.3,<7",
+    "keyring>=25.7,<26",
+    "fastmcp>=4.0,<5",
+    "huggingface_hub>=1.32,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/ayushg8/gpu-router"
+Repository = "https://github.com/ayushg8/gpu-router"
+Issues = "https://github.com/ayushg8/gpu-router/issues"
+
+[project.scripts]
+gpu = "gpu_router.entry:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1",
+    "pytest-asyncio>=1.4",
+    "ruff>=0.16",
+    "mypy>=2.3",
+    "types-PyYAML>=6.0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "real_provider(name): runs against a real cloud provider; skipped unless GPU_ROUTER_REAL_PROVIDERS lists it and its healthcheck passes",
+    "crash: spawns a real daemon subprocess and SIGKILLs it (crash-recovery harness)",
+    "slow: takes more than ~2s of wall time",
+]
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC", "S", "DTZ", "PT", "TID"]
+ignore = [
+    "S101",   # assert is fine in tests and for internal invariants
+    "S603",   # subprocess without shell is the point of the CLI adapters
+    "S607",   # partial executable paths are resolved by providers.cli.CommandRunner
+    "RUF012", # ClassVar annotations on pydantic/dataclass models are fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "DTZ"]
+# Remote-side runner files must run on Python 3.8+ provider images: no 3.9+ syntax upgrades.
+"src/gpu_router/runner/gpu.py" = ["UP"]
+"src/gpu_router/runner/bootstrap.py" = ["UP"]
+"src/gpu_router/runner/storage.py" = ["UP"]
+# Modules allowed to read the wall clock directly: the Clock itself and stdlib-only fast paths.
+"src/gpu_router/clock.py" = ["TID251"]
+"src/gpu_router/runner/*" = ["TID251", "DTZ"]
+"src/gpu_router/statusline/fast.py" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"time.time".msg = "Use the injected gpu_router.clock.Clock (invariant 13)."
+"datetime.datetime.now".msg = "Use the injected gpu_router.clock.Clock (invariant 13)."
+"datetime.datetime.utcnow".msg = "Use the injected gpu_router.clock.Clock (invariant 13)."
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+files = ["src/gpu_router"]
+exclude = ["src/gpu_router/runner/"]
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["keyring.*", "fastmcp.*"]
+ignore_missing_imports = true
+
+# Front ends that later phases add; entry.py imports them lazily and degrades if absent.
+[[tool.mypy.overrides]]
+module = ["gpu_router.statusline.*", "gpu_router.shell.*"]
+ignore_missing_imports = true
+
+# The remote runner (py3.8, untyped, excluded above) is imported by gpu_router.checkpoint
+# for the shared storage layout (phase 5, D40): typed code sees it as Any, never checks it.
+[[tool.mypy.overrides]]
+module = ["gpu_router.runner.*"]
+follow_imports = "skip"

@@ -1,0 +1,284 @@
+# gpu-router provider catalog (packaged). Numbers are data, not prose: /doctor compares them
+# with reality and flags drift. Override any key in <GPU_ROUTER_HOME>/providers.yaml.
+# Sources: docs/spec.md "Providers". verified_at stays null until a human checks at signup.
+#
+# Sections (phase 7b):
+#   providers:  GPU providers. Only `status: active` (the default) entries with an adapter
+#               are ever registered; `verify_at_signup` and `manual_only` ones are listed only.
+#   excluded:   services gpu-router must never use, with the reason and its source. A name
+#               here may not appear under `providers:` (the catalog refuses to load).
+#   inference:  the inference lane (evals, LLM calls): OpenAI-compatible endpoints, free
+#               daily limits and model ids, read by gpu_router.inference (not by the GPU router).
+catalog_version: 1
+providers:
+  local:
+    kind: local
+    display_name: Local Mac (MPS)
+    priority: 90
+    gpus: [{name: MPS, vram_gb: 16, count: 1}]
+    session_hours: null
+    max_concurrency: 1
+    poll_interval_s: 5
+    quota: {unit: gpu_hours, limit: null, reset: none}
+  kaggle:
+    kind: kaggle
+    display_name: Kaggle
+    priority: 20
+    gpus: [{name: P100, vram_gb: 16, count: 1}, {name: T4, vram_gb: 16, count: 2}]
+    session_hours: 12
+    max_concurrency: 1
+    poll_interval_s: 60
+    quota: {unit: gpu_hours, limit: 30, reset: weekly, reset_anchor: "sat 00:00 UTC"}
+    verified_at: null
+    docs: ["https://www.kaggle.com/docs/efficient-gpu-usage"]
+  colab:
+    kind: colab
+    display_name: Google Colab
+    priority: 10
+    gpus: [{name: T4, vram_gb: 16, count: 1}]
+    session_hours: 12
+    max_concurrency: 1
+    poll_interval_s: 30
+    quota: {unit: gpu_hours, limit: null, reset: unknown}
+    verified_at: null
+  lightning:
+    kind: lightning
+    display_name: Lightning AI
+    priority: 30
+    enabled_by_default: true    # phase 7a; not logged in = auth_required, no SDK call made
+    # T4 only (D56): live 2026-09-25 the free account's L4 job create was refused with a
+    # 403 (T4 creates work), although list_machines shows L4 at 1.68 credits/h. A plan that
+    # does run L4 can add it back in the user's providers.yaml (gpus replaces the list):
+    # its rate below still applies.
+    gpus: [{name: T4, vram_gb: 16, count: 1}]
+    # Jobs have no platform time limit (max_runtime is not one): this is gpu-router's own
+    # wall clock per job, enforced in the job by the launcher (providers/lightning/NOTES.md)
+    session_hours: 4
+    max_concurrency: 1
+    poll_interval_s: 60
+    # 15 credits/month after phone verification [3P]; calendar-month reset inferred from
+    # "credits expire at month end" [3P]. Live 2026-09-25: the new account held 5.0 credits
+    # (lightning.ai's own "5 free credits upon registration"), so 15 is only the offline
+    # fallback: the live snapshot's limit = credits left + the month's job costs. T4 list
+    # rate 0.55 credits/h, L4 1.68 (live); 0.68 kept as the effective T4 rate (a 30 s job
+    # cost 0.043: Studio snapshot + machine start are billed too). L4 keeps its own rate
+    # (1.68, the live list rate) for a user catalog that re-adds it, so the router, the 50%
+    # approval rule and the quota handoff see 5 credits as ~3h of L4, not ~7h (D53, D56)
+    quota: {unit: credits, limit: 15, reset: monthly, reset_anchor: "day 1 00:00 UTC"}
+    options: {quota_per_gpu_hour: 0.68, quota_per_gpu_hour_by_gpu: {L4: 1.68}}
+    verified_at: 2026-09-25     # login, T4 job, rates, balance, L4 refused (403); not the monthly top-up
+    docs: ["https://lightning.ai/docs/overview/faq/billing", "https://lightning.ai/pricing"]
+  # ---- verify at signup (phase 7b): listed, never registered or routed ----
+  # `status: verify_at_signup` keeps an entry out of the registry whatever config.yaml says,
+  # until a human has checked every line of `verify_at_signup` and an adapter exists.
+  paperspace:
+    kind: paperspace
+    display_name: Paperspace Gradient
+    status: verify_at_signup
+    enabled_by_default: false
+    priority: 60
+    gpus: [{name: M4000, vram_gb: 8, count: 1}, {name: T4, vram_gb: 16, count: 1}]
+    session_hours: 6
+    quota: {unit: gpu_hours, limit: null, reset: unknown}
+    verified_at: null
+    link: https://www.paperspace.com/gradient
+    note: free M4000/T4 notebooks with a 6h auto-shutdown were advertised; the tier keeps shifting
+    verify_at_signup:
+      - no card asked at signup (a card means drop it)
+      - which free GPU (M4000 8GB, P5000 or T4 16GB) and whether it is guaranteed
+      - session cap (6h advertised) and any monthly hour cap
+      - headless start with an API key (gradient CLI or REST), no browser
+      - one account per person in the terms
+    docs: ["https://docs.digitalocean.com/products/paperspace/"]
+  saturn:
+    kind: saturn
+    display_name: Saturn Cloud
+    status: verify_at_signup
+    enabled_by_default: false
+    priority: 61
+    gpus: []
+    session_hours: null
+    quota: {unit: gpu_hours, limit: null, reset: monthly}
+    verified_at: null
+    link: https://saturncloud.io/
+    note: 150 free hours a month advertised; whether any of them are GPU hours is unclear
+    verify_at_signup:
+      - no card asked at signup (a card means drop it)
+      - whether the 150 free hours include a GPU at all, and which GPU and VRAM
+      - session cap, idle shutdown and the day the monthly hours reset
+      - headless job API or CLI with a token, no browser
+      - one account per person in the terms
+    docs: ["https://saturncloud.io/docs/"]
+  # ---- manual only: shown in `gpu providers` and /providers with a link, never routed ----
+  sagemaker_studio_lab:
+    kind: manual
+    display_name: SageMaker Studio Lab
+    manual_only: true
+    enabled_by_default: false
+    priority: 70
+    gpus: [{name: T4, vram_gb: 16, count: 1}]
+    session_hours: 4
+    quota: {unit: gpu_hours, limit: 4, reset: daily}
+    verified_at: null
+    link: https://studiolab.sagemaker.aws/
+    note: free T4 for 4h a day in a JupyterLab you open in a browser; no API, so gpu-router cannot run jobs there
+    docs: ["https://studiolab.sagemaker.aws/faq"]
+  # ---- test-only providers (registered only when config.test_mode) ----
+  fake:
+    kind: fake
+    display_name: Fake A
+    priority: 1
+    test_only: true
+    gpus: [{name: T4, vram_gb: 16, count: 1}]
+    session_hours: 12
+    max_concurrency: 4
+    poll_interval_s: 1
+    quota: {unit: gpu_hours, limit: 30, reset: weekly}
+  fake-b:
+    kind: fake
+    display_name: Fake B
+    priority: 2
+    test_only: true
+    gpus: [{name: A100-40GB, vram_gb: 40, count: 1}]
+    session_hours: 24
+    max_concurrency: 4
+    poll_interval_s: 1
+    quota: {unit: gpu_hours, limit: 30, reset: monthly}
+
+# ---- never used (spec "Excluded" + phase-7 decisions). `gpu providers` lists them. ----
+excluded:
+  modal:
+    display_name: Modal
+    reason: needs a card
+    quote: "Note that you must have a payment method on file in order to use Modal."
+    source: https://modal.com/docs/guide/billing
+    decided: 2026-09-24
+    note: it was the only free-tier option above 16GB VRAM (A100/H100); the free GPUs left are 16GB (T4, P100; Lightning's free tier refuses L4, D56), and nothing free fits a job that needs more than 16GB
+  runpod: {display_name: RunPod, reason: paid only, source: docs/spec.md, decided: 2026-09-23}
+  lambda: {display_name: Lambda, reason: paid only, source: docs/spec.md, decided: 2026-09-23}
+  vast: {display_name: Vast.ai, reason: paid only, source: docs/spec.md, decided: 2026-09-23}
+  beam: {display_name: Beam, reason: paid only, source: docs/spec.md, decided: 2026-09-23}
+  azure_students:
+    display_name: Azure for Students
+    reason: 3 vCPU cap, no GPU VMs
+    source: docs/spec.md
+    decided: 2026-09-23
+  cloud_trials:
+    display_name: Oracle, Azure and GCP trials
+    reason: needs a card
+    source: docs/spec.md
+    decided: 2026-09-23
+  together:
+    display_name: Together AI
+    reason: free tier discontinued
+    source: docs/spec.md
+    decided: 2026-09-23
+
+# ---- inference lane (phase 7b): evals and LLM calls, not GPU jobs ----
+# Every entry speaks the OpenAI chat-completions API at `base_url` + /chat/completions with
+# `Authorization: Bearer <key>`. Keys live in the Keychain (`gpu login <name>`), never here.
+# limits: per reset window; provider-wide under the entry, per model under models.<alias>.
+# units: requests, tokens, neurons (Cloudflare), usd (HF credits). null = unknown: routed,
+# but ranked after known ones, and a 429 that says the day is used up marks it exhausted.
+# reset: daily_utc | daily_pacific | monthly | rolling_24h. Live numbers (rate-limit headers)
+# win over our own counts while fresh; every number shown says live or est.
+# models: alias -> provider model id (the same alias on several providers lets the router
+# choose); `passthrough` = a regex of provider-native ids accepted even when not listed.
+inference:
+  groq:
+    display_name: Groq
+    priority: 10
+    base_url: https://api.groq.com/openai/v1
+    secrets: {api_key: INFER_GROQ_API_KEY}
+    verify_url: https://api.groq.com/openai/v1/models
+    reset: daily_utc
+    rate_limit_headers: groq   # x-ratelimit-*-requests = requests per day (live)
+    quota_scope: model         # limits are per model: a used-up day blocks that model only
+    models:
+      gpt-oss-20b: {id: openai/gpt-oss-20b, rpm: 30, limits: {requests: 1000, tokens: 200000}}
+      gpt-oss-120b: {id: openai/gpt-oss-120b, rpm: 30, limits: {requests: 1000, tokens: 200000}}
+      qwen3.8-27b: {id: qwen/qwen3.8-27b, rpm: 30, limits: {requests: 1000, tokens: 200000}}
+    verified_at: 2026-09-24
+    docs: ["https://console.groq.com/docs/rate-limits"]
+    link: https://console.groq.com/keys
+    note: free plan; your exact limits are at console.groq.com/settings/limits
+  cloudflare:
+    display_name: Cloudflare Workers AI
+    priority: 20
+    base_url: https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1
+    secrets: {api_key: INFER_CLOUDFLARE_API_TOKEN, account_id: INFER_CLOUDFLARE_ACCOUNT_ID}
+    # the Workers AI model search: works for user and account-owned tokens and proves the
+    # account id + Workers AI Read (tokens/verify differs: /user/... vs /accounts/{id}/...)
+    verify_url: https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/models/search?per_page=1
+    reset: daily_utc
+    limits: {neurons: 10000}
+    # neurons per million tokens [input, output], from the Workers AI pricing page
+    models:
+      llama-3.1-8b: {id: "@cf/meta/llama-3.1-8b-instruct-fp8-fast", neurons_per_mtok: [4119, 34868]}
+      llama-3.2-1b: {id: "@cf/meta/llama-3.2-1b-instruct", neurons_per_mtok: [2457, 18252]}
+      llama-3.2-3b: {id: "@cf/meta/llama-3.2-3b-instruct", neurons_per_mtok: [4625, 30475]}
+      llama-3.3-70b: {id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", neurons_per_mtok: [26668, 204805]}
+      gpt-oss-20b: {id: "@cf/openai/gpt-oss-20b", neurons_per_mtok: [18182, 27273]}
+      gpt-oss-120b: {id: "@cf/openai/gpt-oss-120b", neurons_per_mtok: [31818, 68182]}
+      gemma-3-12b: {id: "@cf/google/gemma-3-12b-it", neurons_per_mtok: [31371, 50560]}
+      qwen2.5-coder-32b: {id: "@cf/qwen/qwen2.5-coder-32b-instruct", neurons_per_mtok: [60000, 90909]}
+      mistral-7b: {id: "@cf/mistral/mistral-7b-instruct-v0.1", neurons_per_mtok: [10000, 17300]}
+    passthrough: "^@cf/"
+    default_neurons_per_mtok: [60000, 204805]   # unlisted @cf/ models: the dearest listed rates
+    verified_at: 2026-09-24
+    docs:
+      - https://developers.cloudflare.com/workers-ai/platform/pricing/
+      - https://developers.cloudflare.com/workers-ai/configuration/open-ai-compatibility/
+    link: https://dash.cloudflare.com/profile/api-tokens
+    note: 10,000 neurons a day, reset 00:00 UTC; the free plan refuses requests past that
+  gemini:
+    display_name: Google AI Studio (Gemini)
+    priority: 30
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai
+    secrets: {api_key: INFER_GEMINI_API_KEY}
+    verify_url: https://generativelanguage.googleapis.com/v1beta/openai/models
+    reset: daily_pacific
+    quota_scope: model
+    # answered live on a free key 2026-09-25; the 2.5 models say "no longer available to
+    # new users" (gemini-3.8-flash / 3.5-flash think first: give them room in max_tokens)
+    models:
+      gemini-3.8-flash: {id: gemini-3.8-flash}
+      gemini-3.5-flash: {id: gemini-3.5-flash}
+      gemini-3.5-flash-lite: {id: gemini-3.5-flash-lite}
+    passthrough: "^(gemini|gemma)-"
+    verified_at: 2026-09-25
+    docs:
+      - https://ai.google.dev/gemini-api/docs/rate-limits
+      - https://ai.google.dev/gemini-api/docs/pricing
+      - https://ai.google.dev/gemini-api/docs/openai
+    link: https://aistudio.google.com/apikey
+    note: free-tier prompts and outputs may be used to improve Google's products; per-model limits are shown only in AI Studio (aistudio.google.com/rate-limit), requests per day reset at midnight Pacific
+  hf:
+    display_name: Hugging Face Inference Providers
+    priority: 40
+    base_url: https://router.huggingface.co/v1
+    secrets: {api_key: HF_TOKEN}   # the same token `gpu login hf` stores (checkpoint/tokens.py)
+    login: hf
+    reset: monthly
+    limits: {usd: 0.10}
+    usd_per_mtok: 0.5   # rough: the real price is whatever the provider HF routes to charges
+    models:
+      gpt-oss-20b: {id: openai/gpt-oss-20b}
+      gpt-oss-120b: {id: openai/gpt-oss-120b}
+      llama-3.1-8b: {id: meta-llama/Llama-3.1-8B-Instruct}
+      llama-3.3-70b: {id: meta-llama/Llama-3.3-70B-Instruct}
+    passthrough: "^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.:-]+$"
+    verified_at: 2026-09-24
+    docs: ["https://huggingface.co/docs/inference-providers/pricing"]
+    link: https://huggingface.co/settings/tokens
+    note: $0.10 of credits a month for a free account (subject to change); past that HF refuses until credits are bought, it never bills on its own
+  hf_zerogpu:
+    display_name: HF ZeroGPU Spaces
+    priority: 90
+    client: none
+    reset: rolling_24h
+    limits: {gpu_seconds: 300}
+    verified_at: 2026-09-24
+    docs: ["https://huggingface.co/docs/hub/spaces-zerogpu"]
+    link: https://huggingface.co/spaces/enzostvs/zero-gpu-spaces
+    note: 5 min of GPU a day for a free account, reset 24h after the first use; ZeroGPU runs Gradio Spaces, not a chat endpoint, so it is listed but never routed
