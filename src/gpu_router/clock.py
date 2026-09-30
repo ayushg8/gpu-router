@@ -56,6 +56,10 @@ class FakeClock:
     - `advance(dt)` moves time and wakes every sleeper whose deadline passed, in deadline
       order. Woken tasks run at the next loop iteration: follow with `await settle()` to let
       them react before asserting.
+    - `suspend(dt)` models the Mac sleeping: wall time jumps, monotonic time does not, and
+      pending sleeps keep their remaining time (asyncio's loop clock is mach_absolute_time,
+      which stops while macOS sleeps, D48). Sleep deadlines are therefore kept on the
+      monotonic clock; `advance`/`set` move both clocks, so nothing else changes.
     - Usable from sync code too (`now()`), e.g. to drive the fake provider's timeline.
     """
 
@@ -76,7 +80,7 @@ class FakeClock:
             await asyncio.sleep(0)
             return
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        heapq.heappush(self._sleepers, (self._now + seconds, next(self._counter), fut))
+        heapq.heappush(self._sleepers, (self._mono + seconds, next(self._counter), fut))
         await fut
 
     def advance(self, seconds: float) -> None:
@@ -84,7 +88,7 @@ class FakeClock:
             raise ValueError("FakeClock cannot go backwards")
         self._now += seconds
         self._mono += seconds
-        while self._sleepers and self._sleepers[0][0] <= self._now:
+        while self._sleepers and self._sleepers[0][0] <= self._mono:
             _, _, fut = heapq.heappop(self._sleepers)
             if not fut.done():
                 fut.set_result(None)
@@ -92,13 +96,21 @@ class FakeClock:
     def set(self, when: float) -> None:
         self.advance(when - self._now)
 
+    def suspend(self, seconds: float) -> None:
+        """The machine sleeps for `seconds`: wall time jumps, monotonic time stands still
+        and no sleeper wakes (their remaining time runs after the wake, like asyncio's)."""
+        if seconds < 0:
+            raise ValueError("FakeClock cannot go backwards")
+        self._now += seconds
+
     @property
     def pending_sleepers(self) -> int:
         return sum(1 for _, _, f in self._sleepers if not f.done())
 
     def next_deadline(self) -> float | None:
+        """Wall time at which the next sleeper wakes if the clock only advances."""
         live = [d for d, _, f in self._sleepers if not f.done()]
-        return min(live) if live else None
+        return min(live) + (self._now - self._mono) if live else None
 
 
 async def settle(rounds: int = 10) -> None:

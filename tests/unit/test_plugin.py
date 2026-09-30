@@ -62,6 +62,26 @@ def test_manifests_agree_on_name_and_version() -> None:
     assert entry["source"] == "./"  # the marketplace and the plugin are the same folder
 
 
+def test_repo_root_marketplace_installs_the_same_plugin_from_github() -> None:
+    """`claude plugin marketplace add ayushg8/gpu-router` clones the repo and reads
+    .claude-plugin/marketplace.json at its root: it must point at plugin/ and agree with
+    the checkout-local marketplace, so both installs give the same plugin."""
+    root = _json(REPO / ".claude-plugin" / "marketplace.json")
+    local = _json(PLUGIN / ".claude-plugin" / "marketplace.json")
+    plugin = _json(PLUGIN / ".claude-plugin" / "plugin.json")
+    assert root["name"] == "gpu-router"  # install id: gpu-router@gpu-router
+    assert root["name"] != local["name"]  # both can be added side by side
+    [entry] = root["plugins"]
+    assert entry["source"] == "./plugin"
+    assert entry["name"] == plugin["name"]
+    assert entry["version"] == plugin["version"] == root["metadata"]["version"]
+    assert {k: v for k, v in entry.items() if k != "source"} == {
+        k: v for k, v in local["plugins"][0].items() if k != "source"
+    }
+    assert (REPO / entry["source"] / ".claude-plugin" / "plugin.json").is_file()
+    assert root["owner"] == local["owner"]
+
+
 def test_mcp_server_is_gpu_mcp() -> None:
     servers = _json(PLUGIN / ".mcp.json")["mcpServers"]
     assert servers == {"gpu-router": {"command": "gpu", "args": ["mcp"]}}

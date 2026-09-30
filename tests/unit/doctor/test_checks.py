@@ -834,6 +834,32 @@ def test_plugin(make_env: MakeEnv, user_home: Path) -> None:
     assert "claude plugin update" in (checks.check_plugin(make_env()).fix or "")
 
 
+def test_plugin_installed_from_github(
+    make_env: MakeEnv, user_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The README's one-line install (`claude plugin marketplace add ayushg8/gpu-router`)
+    records gpu-router@gpu-router: doctor sees it and its fixes name that marketplace."""
+    installed = user_home / ".claude" / "plugins" / "installed_plugins.json"
+    version = checks._packaged_plugin_version(make_env())
+    body = {"version": 2, "plugins": {checks.GITHUB_PLUGIN_KEY: [{"version": version}]}}
+    write(installed, json.dumps(body), 0o644)
+    r = checks.check_plugin(make_env())
+    assert r.status is OK
+    assert r.summary.startswith("gpu-router@gpu-router installed")
+    body["plugins"][checks.GITHUB_PLUGIN_KEY][0]["version"] = "0.0.1"  # type: ignore[index]
+    write(installed, json.dumps(body), 0o644)
+    assert checks.check_plugin(make_env()).fix == (
+        "claude plugin marketplace update gpu-router && claude plugin update gpu-router@gpu-router"
+    )
+    installed.unlink()
+    # not a checkout (e.g. `uv tool install git+https://...`): the fix installs from GitHub
+    monkeypatch.setattr(ProbeEnv, "gpu_router_repo", lambda self: None)
+    assert checks.check_plugin(make_env()).fix == (
+        "claude plugin marketplace add ayushg8/gpu-router && "
+        "claude plugin install gpu-router@gpu-router"
+    )
+
+
 def test_colab_skill_is_offered_a_confirmed_move(make_env: MakeEnv, user_home: Path) -> None:
     assert checks.check_colab_skill(make_env()).status is OK
     (user_home / ".claude" / "skills" / "colab").mkdir(parents=True)

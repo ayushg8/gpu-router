@@ -2,7 +2,8 @@
 providers, the real Keychain or the user's data dir.
 
 Autouse:
-- `gpu_home`       tmp GPU_ROUTER_HOME (+ GPU_ROUTER_TEST_MODE=1), clears other GPU_ROUTER_* vars
+- `gpu_home`       tmp GPU_ROUTER_HOME (+ GPU_ROUTER_TEST_MODE=1), clears other GPU_ROUTER_* vars,
+                   PYTHON_KEYRING_BACKEND=null for child processes
 - `memory_keyring` in-memory keyring backend for this process
 
 On request:
@@ -89,6 +90,11 @@ def gpu_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv(ENV_HOME, str(home))
     monkeypatch.setenv("GPU_ROUTER_TEST_MODE", "1")
+    # invariant 20 for child processes too (daemon subprocesses, the real `gpu` executable,
+    # `gpu mcp` over stdio): memory_keyring only covers this process, so children get
+    # keyring's null backend and can never read, write or prompt for the macOS Keychain
+    # (CI runners included)
+    monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.null.Keyring")
     return home
 
 

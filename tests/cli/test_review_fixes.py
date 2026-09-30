@@ -83,9 +83,12 @@ def test_help_still_exits_0(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- run --json --wait
 
 
-def test_run_json_wait_error_after_submit_names_the_job(
-    cli: Cli, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# The patches below live in their own MonkeyPatch context: `monkeypatch.undo()` would also
+# undo the autouse gpu_home fixture (GPU_ROUTER_HOME, test mode, the null keyring), so the
+# `cli("cancel")` after it went to the default data dir, i.e. the real daemon (invariant 20).
+
+
+def test_run_json_wait_error_after_submit_names_the_job(cli: Cli) -> None:
     """Review finding: an error while waiting was a bare envelope with no job id, so an
     agent could not tell a job exists and would resubmit."""
     cli.fake(duration=30)
@@ -93,34 +96,32 @@ def test_run_json_wait_error_after_submit_names_the_job(
     def boom(self: Any, ref: str, *, after: int = 0) -> Any:
         raise DaemonUnavailable("lost the daemon", hint="start it")
 
-    monkeypatch.setattr("gpu_router.client.GpuClient.events", boom)
-    data, res = cli.json("run", "--wait")
-    assert res.exit_code == exitcodes.DAEMON
-    detail = data["error"]["detail"]
-    assert len(detail["job_id"]) == 12
-    assert detail["short_id"]
-    assert detail["state"]
-    human = cli("run")
-    assert "was submitted and keeps running" in human.stderr
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gpu_router.client.GpuClient.events", boom)
+        data, res = cli.json("run", "--wait")
+        assert res.exit_code == exitcodes.DAEMON
+        detail = data["error"]["detail"]
+        assert len(detail["job_id"]) == 12
+        assert detail["short_id"]
+        assert detail["state"]
+        human = cli("run")
+        assert "was submitted and keeps running" in human.stderr
     for ref in (detail["job_id"],):
         cli("cancel", ref)
 
 
-def test_run_json_wait_ctrl_c_reports_detached_job(
-    cli: Cli, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_run_json_wait_ctrl_c_reports_detached_job(cli: Cli) -> None:
     cli.fake(duration=30)
 
     def interrupt(self: Any, ref: str, *, after: int = 0) -> Any:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("gpu_router.client.GpuClient.events", interrupt)
-    data, res = cli.json("run", "--wait")
-    assert res.exit_code == exitcodes.INTERRUPTED
-    assert data["detached"] is True
-    assert len(data["job"]["id"]) == 12
-    monkeypatch.undo()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("gpu_router.client.GpuClient.events", interrupt)
+        data, res = cli.json("run", "--wait")
+        assert res.exit_code == exitcodes.INTERRUPTED
+        assert data["detached"] is True
+        assert len(data["job"]["id"]) == 12
     cli("cancel", data["job"]["id"])
 
 

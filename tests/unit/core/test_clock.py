@@ -55,3 +55,32 @@ async def test_sleep_zero_yields_and_system_clock() -> None:
     await s.sleep(-1)
     assert s.monotonic() >= t
     assert s.now() > FAKE_EPOCH - 10**9
+
+
+async def test_suspend_jumps_wall_time_but_not_pending_sleeps() -> None:
+    """A Mac that sleeps: wall time jumps, monotonic time and sleep deadlines do not (D48)."""
+    c = FakeClock()
+    woke: list[float] = []
+
+    async def sleeper() -> None:
+        await c.sleep(30)
+        woke.append(c.now())
+
+    task = asyncio.create_task(sleeper())
+    await settle()
+    c.advance(10)
+    c.suspend(5 * 3600)
+    await settle()
+    assert woke == []
+    assert c.now() == FAKE_EPOCH + 10 + 5 * 3600
+    assert c.monotonic() == 10
+    assert c.next_deadline() == c.now() + 20  # 20 s of the sleep are left after the wake
+    c.advance(19)
+    await settle()
+    assert woke == []
+    c.advance(1)
+    await settle()
+    assert woke == [FAKE_EPOCH + 30 + 5 * 3600]
+    with pytest.raises(ValueError, match="backwards"):
+        c.suspend(-1)
+    await task

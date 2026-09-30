@@ -1,5 +1,7 @@
 # gpu-router
 
+[![CI](https://github.com/ayushg8/gpu-router/actions/workflows/ci.yml/badge.svg)](https://github.com/ayushg8/gpu-router/actions/workflows/ci.yml)
+
 **Run your training scripts on free cloud GPUs with one command, and let your coding agents do the same without spending your quota blind.**
 
 `gpu run train.py` packages your project, picks the best free GPU you can reach right now (Kaggle, Google Colab, Lightning AI, or your Mac's MPS for smoke tests), streams the logs and drops the outputs in `./runs/<id>/`.
@@ -90,7 +92,7 @@ $ gpu route --vram 24 train.py
 
 Per-project defaults go in a `gpu.yaml` at the project root (script, args, hours, VRAM, data, secrets), and flags override it. [docs/cli.md](docs/cli.md) has every command, flag, exit code and `--json` shape.
 
-Only want the CLI and the MCP server? `uv tool install git+https://github.com/ayushg8/gpu-router` works too, but `gpu setup` installs the Claude Code plugin only from an editable checkout, so that one step becomes manual.
+Only want the CLI and the MCP server? `uv tool install git+https://github.com/ayushg8/gpu-router` works too, but `gpu setup` installs the Claude Code plugin only from an editable checkout, so run the two `claude plugin` commands under [Claude Code](#claude-code) yourself.
 
 ### The shell
 
@@ -164,12 +166,19 @@ Checkpoints sync every 20 minutes by default. About 30 minutes before a session 
 
 ### Claude Code
 
-From your checkout, with `gpu` on your PATH (or let `gpu setup` do it):
+With `gpu` on your PATH, install the plugin straight from GitHub:
+
+```bash
+claude plugin marketplace add ayushg8/gpu-router
+claude plugin install gpu-router@gpu-router
+gpu statusline install   # optional: shows the settings.json diff and asks first; undo with gpu statusline uninstall
+```
+
+Working from a clone (or letting `gpu setup` do it)? The checkout carries its own marketplace, so plugin edits show up without a push:
 
 ```bash
 claude plugin marketplace add "$PWD/plugin"
 claude plugin install gpu-router@gpu-router-local
-gpu statusline install   # optional: shows the settings.json diff and asks first; undo with gpu statusline uninstall
 ```
 
 MCP only, no plugin: `claude mcp add gpu-router -- gpu mcp`.
@@ -234,10 +243,12 @@ Groq and Gemini have been verified live; Cloudflare and Hugging Face are wired u
 
 ```bash
 uv sync
-uv run pytest            # 2,595 tests; real providers are skipped unless GPU_ROUTER_REAL_PROVIDERS opts in
+uv run pytest            # 2,610 tests; real providers are skipped unless GPU_ROUTER_REAL_PROVIDERS opts in
 uv run pytest -m crash   # crash-recovery harness: spawns a real daemon and SIGKILLs it mid-run
 uv run ruff check src tests && uv run mypy
 ```
+
+CI runs the same checks (ruff, `ruff format --check`, mypy, the full test suite) on macOS for every push and pull request. The tests need no provider CLI, Keychain entry, `~/.claude` or network.
 
 Adding a provider means an adapter with seven calls (`submit`, `status`, `logs`, `fetch`, `cancel`, `quota`, `healthcheck`), a `providers.yaml` entry and a pass through the shared adapter contract suite. Each provider's quirks, failure modes and exact commands live in `src/gpu_router/providers/<name>/NOTES.md`.
 

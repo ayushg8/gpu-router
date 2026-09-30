@@ -27,6 +27,9 @@ uv run pytest tests/unit/core -q          # one area
 uv run pytest -m crash                    # crash-recovery harness (spawns + SIGKILLs a daemon)
 uv run ruff check src tests && uv run ruff format --check src tests
 uv run mypy                               # strict, src/gpu_router (runner/ excluded)
+# CI (.github/workflows/ci.yml, macos-latest, every push + PR) runs exactly: uv sync --locked,
+# ruff check, ruff format --check, mypy, pytest -q; no provider CLI, Keychain, ~/.claude or
+# network needed (D59)
 uv run gpu daemon run --foreground        # daemon in the terminal (GPU_ROUTER_HOME=/tmp/x to isolate)
 GPU_ROUTER_TEST_MODE=1 uv run gpu daemon run --foreground --port 0   # with the fake provider
 ```
@@ -56,7 +59,7 @@ real code; everything else has signatures + docstrings and `NotImplementedError`
 | `statefile.py` | state.json status-line cache: shape (real) + coalescing writer | 1 | A |
 | `config.py` | config.yaml models (real), load/save/migrate | 1 | A |
 | `paths.py` | data-dir layout, stdlib only (real) | 1 | A |
-| `clock.py` | Clock protocol, SystemClock, FakeClock (real) | 1 | A |
+| `clock.py` | Clock protocol, SystemClock, FakeClock (real); FakeClock sleeps on its monotonic time and `suspend(dt)` models a Mac asleep (D57) | 1 | A |
 | `ids.py` | job ids, short ids, attempt keys | 1 | A |
 | `lock.py` | single-instance flock | 1 | A |
 | `log.py` | JSON structured logging + redaction filter | 1 | A |
@@ -99,7 +102,7 @@ real code; everything else has signatures + docstrings and `NotImplementedError`
 | `engine/calls.py` | `AdapterCaller`: thread pool, timeouts, contract enforcement | 1 | C |
 | `engine/capture.py` | log capture: attempt log files, protocol parsing, metrics/ckpt | 1 | C |
 | `engine/driver.py` | `JobDriver`: one asyncio task per non-terminal job; phase 5 (D40): storage env/data per attempt, checkpoint reconcile before a migration, planned handoff (session cap / quota), progress-aware max_attempts; re-asks the policy after an approval, in place (D43) | 1 | C |
-| `engine/supervisor.py` | `Supervisor`: recovery, drivers, user actions, health loop | 1 | C |
+| `engine/supervisor.py` | `Supervisor`: recovery, drivers, user actions, health loop (backoff re-checks of unhealthy providers, wake-from-sleep detection + grace, `ProviderView` "re-checking in ..." note, D57) | 1 | C |
 | `engine/crashpoints.py` | test-mode crash injection (`GPU_ROUTER_CRASH_AT`) | 1 | C |
 | `engine/context.py` | builds the router input (RoutingContext), shared by drivers and `/v1/route` dry runs | 1 | C |
 | `engine/_obs.py` | logging wrapper so a logging failure never stops a job | 1 | C |
@@ -140,6 +143,8 @@ real code; everything else has signatures + docstrings and `NotImplementedError`
 | `quota/service.py` | `QuotaService` (daemon): ledger views for GET /v1/quota and state.json, background refresh of live readings (TTL, due `early_s` before it, failure backoff, injected clock; D44), never on the routing path | 5 | - |
 | `quota/settings.py` | `routing.quota` knobs (ttl_s, refresh_s, wait_s, retry_failed_s, unknown_window_hours) | 5 | - |
 | `mcp/server.py`, `mcp/tools.py` | `gpu mcp`: FastMCP stdio server, the spec's 7 tools, no approve tool (`server.py` = agent-facing text + error envelope; `tools.py` = logic over `GpuClient`, no MCP imports); see "Agent integration (phase 6a)" | 6 | - |
+| `.claude-plugin/marketplace.json` (repo root) | marketplace `gpu-router` for `claude plugin marketplace add ayushg8/gpu-router`, one entry with source `./plugin` (D58) | - | - |
+| `.github/workflows/ci.yml` (repo root) | CI on macos-latest: uv sync --locked, ruff check + format --check, mypy, pytest -q (D59) | - | - |
 | `plugin/` (repo root) | Claude Code plugin + local marketplace `gpu-router-local`: `.mcp.json`, `skills/gpu-router/SKILL.md`, `commands/gpu-{run,status,approve,statusline}.md`, `statusline/gpu-statusline.sh` (6b's wrapper, shipped with the plugin, activated only by `gpu statusline install`) | 6 | - |
 | `docs/codex/AGENTS-section.md` | Codex: setup (`codex mcp add`, config.toml) + the AGENTS.md section (the skill, adapted) | 6 | - |
 | `statusline/fast.py` | `gpu status --line`: 0-2 rows from state.json in the user's status-line style (stdlib only, never calls the daemon, ~21 ms p50 incl. interpreter); see "Claude Code status line (phase 6b)" | 6 | - |
@@ -316,6 +321,18 @@ Phases 7-8 integration (D53): `tests/unit/router/test_gpu_rates.py` (Lightning L
 its own rate: share, quota rejection, pins; `gpu_name`), `tests/unit/statusline/test_install_perms.py`
 (record dirs 0700, a loose one tightened, nothing above the data dir touched),
 `tests/shell/test_login_steps.py` (`/login kaggle|lightning` keeps `gpu login ...`).
+Sleep/wake recovery (D57): `tests/unit/engine/test_health_recheck.py` (60/120/240/480/900/900
+backoff, reset on a healthy answer, the view's "re-checking in 40s" + `next_healthcheck_at`, a
+driver-marked login problem re-checked in 1m, `FakeClock.suspend` and a long loop stall both
+count as a wake, the grace before the post-wake checks, a post-wake failure retried in 1m, a
+queued job's quota-reset wait cut short by the wake, the loop surviving a bookkeeping error,
+a real-thread healthcheck timeout) and `tests/unit/core/test_clock.py::test_suspend_*`.
+GitHub marketplace + CI (D58, D59): `tests/unit/test_plugin.py::test_repo_root_marketplace_*`,
+`tests/unit/doctor/test_checks.py::test_plugin_installed_from_github`,
+`tests/unit/setup/test_integrations.py::test_plugin_from_github_*`,
+`tests/unit/core/test_secrets.py::test_child_processes_never_reach_the_macos_keychain`;
+`tests/cli/test_review_fixes.py` keeps its GpuClient patches in `MonkeyPatch.context()`
+(never `monkeypatch.undo()`, which also undoes the autouse `gpu_home`).
 
 ## Core invariants
 
@@ -366,7 +383,8 @@ Code comments cite these numbers. Never renumber; append new ones at the end.
 19. **Free tiers only, one account per provider.** No adapter may create accounts, rotate
     accounts or use a provider that needs a card (spec hard constraints).
 20. **Tests never touch real providers, the real Keychain or the user's data dir.** `conftest.py`
-    points `GPU_ROUTER_HOME` at a tmp dir and installs an in-memory keyring for every test;
+    points `GPU_ROUTER_HOME` at a tmp dir and installs an in-memory keyring for every test
+    (child processes get `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring`, D59);
     real-provider tests need `@pytest.mark.real_provider` + `GPU_ROUTER_REAL_PROVIDERS`.
 21. **Migrations and config versions are append-only once a phase ships.** Change the schema with
     `0002_*.sql`; change config shape with `CONFIG_MIGRATIONS[n]`. 0001 is editable until phase 1
@@ -515,7 +533,7 @@ approval preview: the daemon's rules (GET /v1/policy) evaluated locally on a pla
 Job; the daemon decides again at placement; it also carries
 `hours`, `hours_source` and `stopped_for_approval_after_h` (D48).
 
-**Plugin** `plugin/` is both the marketplace (`.claude-plugin/marketplace.json`, name
+**Plugin** `plugin/` is both the checkout's marketplace (`.claude-plugin/marketplace.json`, name
 `gpu-router-local`, plugin source `./`) and the plugin (`.claude-plugin/plugin.json`,
 `.mcp.json` = `gpu mcp`, which needs `gpu` on PATH; `skills/gpu-router/SKILL.md`, the one
 skill: the Codex copy in `docs/codex/AGENTS-section.md` must be kept in sync;
@@ -527,10 +545,17 @@ preview:*)`: shows whether the rows are installed plus a preview, and tells the 
 `gpu statusline install` in their terminal (it never installs); `statusline/` is 6b's
 `gpu-statusline.sh`, byte-identical to the packaged copy that `gpu statusline install`
 copies to `<home>/statusline/` (a plugin cannot set `statusLine`, and the versioned plugin
-cache path would break on every plugin update, D47)). Install (run by hand from the repo root;
-never from a build session):
+cache path would break on every plugin update, D47)). The repo root carries a second
+marketplace, `.claude-plugin/marketplace.json` (name `gpu-router`, one entry, source
+`./plugin`, same description/version as the local one; `tests/unit/test_plugin.py` keeps them
+in step), so users install from GitHub without a clone (D58). Install (run by hand; never from
+a build session):
 
 ```bash
+# from GitHub (what the README leads with; `gpu` must be on PATH for the MCP server)
+claude plugin marketplace add ayushg8/gpu-router
+claude plugin install gpu-router@gpu-router
+# from a checkout (repo root): its own marketplace, plugin edits need no push
 uv tool install --editable .              # puts `gpu` on PATH
 claude plugin marketplace add ./plugin
 claude plugin install gpu-router@gpu-router-local
@@ -541,7 +566,8 @@ claude plugin install gpu-router@gpu-router-local
 ```
 
 Checks (read-only): `claude plugin validate plugin` (validates the marketplace when both
-manifests exist), `claude plugin validate --strict plugin/.claude-plugin/plugin.json`,
+manifests exist), `claude plugin validate --strict .` (the repo-root marketplace),
+`claude plugin validate --strict plugin/.claude-plugin/plugin.json`,
 `claude --plugin-dir plugin plugin details gpu-router` (4 commands + 1 skill + 1 MCP server,
 ~258 tokens always on as of the phase-6 integration). The add + install commands above were
 run against a throwaway `CLAUDE_CONFIG_DIR` (Claude Code 2.1.281): installed, enabled, same
@@ -558,6 +584,8 @@ dev machine's real `~/.claude` or `~/.codex`; run from the repo root):
 # 1. gpu on PATH (needed by the plugin's MCP server, the status line and Codex)
 uv tool install --editable .
 # 2. Claude Code plugin: MCP server + skill + /gpu-run /gpu-status /gpu-approve /gpu-statusline
+#    (or from GitHub: claude plugin marketplace add ayushg8/gpu-router &&
+#     claude plugin install gpu-router@gpu-router)
 claude plugin marketplace add ./plugin
 claude plugin install gpu-router@gpu-router-local
 # 3. status line rows (prints the settings.json diff, asks [y/N]; undo: gpu statusline uninstall)
@@ -1962,3 +1990,85 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   claude process. No wrapper change. Known limit: a pid reused by a later claude process
   could match an old session's still-active job (only while that job is active).
   Tests: `tests/unit/statusline/test_session_scope.py`.
+- **D57** (sleep/wake recovery, found live 2026-09-29) After a night asleep on a flaky
+  network, the healthchecks right after the wake timed out (`kaggle --version` > 15 s,
+  `lightning whoami` > 42 s, `colab sessions`); colab happened to recover 26 s later, kaggle and
+  lightning stayed unavailable until the flat `health_recheck_s` (900 s) re-check. (1)
+  **Backoff**: an unhealthy provider is re-checked `engine.health_recheck_min_s` (60) after its
+  first failed check, doubling up to `health_recheck_s` (900, now the cap): 60, 120, 240, 480,
+  900, 900; a healthy answer resets it. Counts and due times live in the Supervisor (a
+  restarted daemon checks every provider anyway); a provider a driver marked (AuthRequired,
+  no healthcheck) is picked up one short backoff after its `last_healthcheck_at`; due checks
+  run concurrently (`_check_many`), so one slow CLI no longer delays the rest; a bookkeeping
+  error in a turn is logged (`engine.bug`) and the loop goes on. (2) **Wake**: the loop ticks
+  every `health_tick_s` (30, or sooner when a re-check is due). A wake = wall time across its
+  sleep > 2 x the sleep + 60 s, or wall time ahead of the monotonic clock by > 60 s since the
+  last turn (asyncio's clock is `mach_absolute_time`, which stops while macOS sleeps, D48; the
+  second signal also catches a sleep during a check). Then: log `daemon.wake` ("woke from sleep
+  after about 5h; re-checking every provider in 30s, once the network is back"), reset every
+  backoff, wait `wake_grace_s` (30) so the first check does not fail on a network that is still
+  coming back, check every provider (healthy ones too), and wake queued drivers (a quota-reset
+  wait sleeps on the stopped clock as well). A post-wake failure is retried 60 s later. (3)
+  **What happened + what next**: a failed check (a timeout included: the adapters' own bounds,
+  or the caller's `<p> healthcheck timed out after 60s`) stores `unavailable` with the
+  provider's reason as before; `ProviderView.health_reason` for unavailable / auth_required /
+  degraded ends with "; re-checking in 1m", computed when the view is built so it never goes
+  stale, and the additive `ProviderView.next_healthcheck_at` carries the time; the stored
+  reason stays the provider's own words (router messages quote it). `provider.health` lines
+  say "kaggle: ok -> unavailable (kaggle --version did not answer within 15s); re-checking in
+  1m"; a check that fails again logs at debug. (4) `FakeClock` keeps sleep deadlines on its
+  monotonic time and gains `suspend(dt)` (wall time jumps; monotonic time and pending sleeps
+  do not); `advance`/`set` move both, so existing tests see no change. The four config keys are
+  additive (CONFIG_VERSION stays 1). Also: the Lightning SDK now runs from its `uv tool` env
+  (`~/.local/share/uv/tools/lightning-sdk/bin/python`, which `SdkBridge` prefers), so a
+  driver call no longer resolves `uv run --with lightning-sdk` over the network first.
+  Verified: 2587 passed, 23 skipped (whole suite, crash harness included), ruff check/format +
+  mypy clean; the launchd daemon restarted on this code: `gpu providers` colab / kaggle /
+  lightning / local up, `/v1/providers` carries `next_healthcheck_at`, `gpu doctor` 31 ok /
+  0 warn / 0 fail. Not verified live: a real sleep/wake (the FakeClock tests model it).
+- **D58** (plugin install from GitHub) (1) A repo-root `.claude-plugin/marketplace.json`,
+  marketplace `gpu-router`, lists the one plugin with source `./plugin`, so `claude plugin
+  marketplace add ayushg8/gpu-router` + `claude plugin install gpu-router@gpu-router` works
+  without a clone (the shorthand clones the repo and reads exactly that file). `plugin/`'s own
+  marketplace `gpu-router-local` stays for checkouts and `gpu setup`; the two entries share
+  name, description and version (`tests/unit/test_plugin.py`). (2) Doctor knows both installs:
+  not installed and not running from a checkout, the fix is the GitHub one-liner (it was
+  `claude plugin install gpu-router@gpu-router-local`, which fails without that marketplace);
+  an outdated install is updated through its own marketplace; the wizard's enable/update
+  commands take the plugin key from doctor's fix, so a GitHub install is never switched to
+  gpu-router-local. (3) README leads with the GitHub commands and keeps the clone-based ones.
+  Verified with Claude Code 2.1.283, each in a throwaway `CLAUDE_CONFIG_DIR`: `claude plugin
+  validate --strict .` passed (0 warnings); `marketplace add <repo root>` + `install
+  gpu-router@gpu-router`: installed, enabled, v0.1.0, 4 commands + 1 skill + the MCP server
+  (`plugin details` lists commands as skills now: 5; ~305 tokens always on), the cache holds
+  only plugin/ with the wrapper's exec bit; a git-cloned marketplace (a throwaway commit of
+  the tree served over local smart HTTP, the clone path `owner/repo` takes) installed the
+  same; `marketplace add ./plugin` + `install gpu-router@gpu-router-local` still works;
+  `marketplace add ayushg8/gpu-router` against the public repo before this change is pushed
+  fails with "Marketplace file not found at .../.claude-plugin/marketplace.json", the file
+  this adds. Not verified: the GitHub install after the push (the maintainer pushes).
+- **D59** (CI, 2026-09-29) `.github/workflows/ci.yml`: push + pull_request on `macos-latest`
+  (the tool is macOS-only), `actions/checkout@v7`, `astral-sh/setup-uv@v10.2.0` (setup-uv
+  publishes no major tag, so the full version is pinned) with its cache, then `uv sync
+  --locked` (a stale uv.lock fails), `ruff check src tests`, `ruff format --check src tests`,
+  `mypy`, `pytest -q`; `contents: read`, 30 min timeout, superseded runs cancelled; actionlint
+  1.7.12 clean. README carries the badge. Hermetic tests: (1) child processes now get
+  `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` from the autouse `gpu_home` fixture:
+  `memory_keyring` only covered the test process, so a daemon subprocess or the real `gpu`
+  executable used the macOS Keychain backend (a runner has nobody to answer a prompt; on the
+  dev machine a job listing secrets would have read real items). (2) Found by the local CI
+  run (a probe plugin listing what each test adds under an empty HOME):
+  `tests/cli/test_review_fixes.py::test_run_json_wait_{error_after_submit,ctrl_c}...` called
+  `monkeypatch.undo()` mid-test, which also undid `gpu_home` and the cli fixture (GPU_ROUTER_HOME,
+  test mode, GPU_ROUTER_NO_AUTOSTART), so their `cli("cancel")` went to the DEFAULT
+  data dir: in the CI run it auto-started a second daemon there (port taken, it exited), on the
+  dev machine that is the real daemon's (a cancel of a job id it does not know); the patches
+  now live in `pytest.MonkeyPatch.context()`. One colab test ran the fake
+  CLI without the adapter's private CLI home (the fake refuses the real home, so harmless) and
+  now passes `home=colab.cli_home`. After the fixes the probe finds nothing added under HOME
+  besides uv's own cache. Local CI simulation: a fresh copy of the tree (tracked +
+  untracked-not-ignored files) committed into a new git repo, `env -i` with HOME = an empty dir,
+  PATH = /usr/bin:/bin + a dir holding only uv, CI=true: uv downloaded CPython 3.12.13 and the
+  locked deps, ruff / format / mypy passed, pytest 2582 passed, 28 skipped in 6m32s (the 5
+  skips beyond the dev machine's 23 are environmental: no Python 3.8, no ~/.claude/settings.json,
+  3 real-SDK-shape checks with the pinned lightning-sdk absent from uv's offline cache).

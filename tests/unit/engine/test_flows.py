@@ -394,7 +394,9 @@ async def test_provider_views_and_healthcheck(eng: Engine) -> None:
     eng.fake("fake-b").set_health("unavailable", "simulated outage")
     view = await eng.supervisor.healthcheck("fake-b")
     assert view.health is ProviderHealth.UNAVAILABLE
-    assert view.health_reason == "simulated outage"
+    # D57: the view says when the health loop looks again; the stored reason is unchanged
+    assert view.health_reason == "simulated outage; re-checking in 1m"
+    assert eng.store.get_provider_state("fake-b").health_reason == "simulated outage"
 
 
 async def test_unhealthy_provider_is_skipped_until_it_recovers(eng: Engine) -> None:

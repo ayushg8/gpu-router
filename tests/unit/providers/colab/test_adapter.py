@@ -486,7 +486,7 @@ def test_crash_mid_setup_is_lost_and_the_session_is_stopped(
 ) -> None:
     key = "gpu-deadbeef0001-1"
     rec = _dead_setup_record(colab, key)
-    cli = ColabCli([*colab._cli().prefix], colab.config_file)
+    cli = ColabCli([*colab._cli().prefix], colab.config_file, home=colab.cli_home)
     assert cli.run(["new", "--gpu", "T4", "-s", rec.session], timeout=20).ok
     ref = colab.lookup_by_key(key)
     assert ref is not None

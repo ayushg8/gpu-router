@@ -152,6 +152,36 @@ def test_plugin_disabled_is_enabled(sandbox: Sandbox) -> None:
     ]
 
 
+def test_plugin_from_github_is_updated_through_its_own_marketplace(sandbox: Sandbox) -> None:
+    """An install made with `claude plugin marketplace add ayushg8/gpu-router` is updated
+    through that marketplace, never switched to the checkout's gpu-router-local."""
+    sandbox.tools["claude"] = "/fake/bin/claude"
+    key = "gpu-router@gpu-router"
+    sandbox.write(
+        ".claude/plugins/installed_plugins.json",
+        json.dumps({"plugins": {key: [{"version": "0.0.1"}]}}),
+    )
+
+    def update(_argv: list[str], _env: Any) -> Any:
+        sandbox.write(
+            ".claude/plugins/installed_plugins.json",
+            json.dumps({"plugins": {key: [{"version": "0.1.0"}]}}),
+        )
+        return ok()
+
+    sandbox.run.on(r"claude plugin marketplace update gpu-router$", lambda _a, _e: ok())
+    sandbox.run.on(r"claude plugin update gpu-router@gpu-router$", update)
+    ui = ScriptedUi([True])
+    ctx = sandbox.ctx(ui, only=["integration.plugin"])
+    integrations.run(ctx)
+    assert ctx.results[-1].outcome is Outcome.DONE, ui.text
+    assert [c[1:] for c in sandbox.run.ran("claude")] == [
+        ["plugin", "marketplace", "update", "gpu-router"],
+        ["plugin", "update", key],
+    ]
+    assert f"undo: claude plugin uninstall {key}" in ui.text
+
+
 def test_plugin_without_claude_is_manual(sandbox: Sandbox) -> None:
     ctx = sandbox.ctx(ScriptedUi([]), only=["integration.plugin"])
     integrations.run(ctx)

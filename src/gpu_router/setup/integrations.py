@@ -149,14 +149,18 @@ def _known_marketplace(ctx: Ctx) -> bool:
 
 
 def plugin_commands(ctx: Ctx, fix: str | None) -> list[list[str]] | None:
-    """`claude` argv tails for the state doctor reported (None: cannot tell from here)."""
+    """`claude` argv tails for the state doctor reported (None: cannot tell from here).
+    Enable/update act on the install doctor found, which may come from the checkout's
+    marketplace (gpu-router@gpu-router-local) or the GitHub one (gpu-router@gpu-router)."""
     from gpu_router.doctor.checks import PLUGIN_KEY
 
     repo = ctx.env.gpu_router_repo()
     if fix and fix.startswith("claude plugin enable"):
-        return [["plugin", "enable", PLUGIN_KEY]]
+        return [["plugin", "enable", fix.split()[-1]]]
     if fix and "plugin update" in fix:
-        return [["plugin", "marketplace", "update", MARKETPLACE], ["plugin", "update", PLUGIN_KEY]]
+        key = fix.split()[-1]
+        market = key.partition("@")[2] or MARKETPLACE
+        return [["plugin", "marketplace", "update", market], ["plugin", "update", key]]
     if repo is None:
         return None
     cmds: list[list[str]] = []
@@ -212,7 +216,7 @@ def _plugin(ctx: Ctx) -> None:
         "skill, /gpu-run /gpu-status /gpu-approve /gpu-statusline",
         "dim",
     )
-    ctx.ui.say("undo: claude plugin uninstall gpu-router@gpu-router-local", "dim")
+    ctx.ui.say(f"undo: claude plugin uninstall {cmds[-1][-1]}", "dim")
     if ctx.opts.dry_run:
         ctx.dry(item, "install the Claude Code plugin")
         return

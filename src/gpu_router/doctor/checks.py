@@ -53,7 +53,10 @@ ADC_LOGIN = (
 KAGGLE_FILE_FIX = (
     "mkdir -p ~/.kaggle && mv ~/Downloads/kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json"
 )
-PLUGIN_KEY = "gpu-router@gpu-router-local"
+PLUGIN_KEY = "gpu-router@gpu-router-local"  # the checkout's own marketplace (plugin/)
+#: the repo-root marketplace: `claude plugin marketplace add ayushg8/gpu-router`
+GITHUB_MARKETPLACE = "ayushg8/gpu-router"
+GITHUB_PLUGIN_KEY = "gpu-router@gpu-router"
 DISK_WARN_GB = 5.0
 DISK_FAIL_GB = 1.0
 HF_HUB_MIN = "1.32"
@@ -1672,7 +1675,8 @@ def check_plugin(env: ProbeEnv) -> CheckResult:
     install = (
         f"claude plugin marketplace add {_q(repo / 'plugin')} && claude plugin install {PLUGIN_KEY}"
         if repo
-        else f"claude plugin install {PLUGIN_KEY}"
+        else f"claude plugin marketplace add {GITHUB_MARKETPLACE} && "
+        f"claude plugin install {GITHUB_PLUGIN_KEY}"
     )
     f = env.claude_dir / "plugins" / "installed_plugins.json"
     try:
@@ -1716,8 +1720,8 @@ def check_plugin(env: ProbeEnv) -> CheckResult:
             *t,
             WARN,
             f"installed {version}, this gpu-router ships {want}",
-            "claude plugin marketplace update gpu-router-local && "
-            f"claude plugin update {PLUGIN_KEY}",
+            f"claude plugin marketplace update {str(key).partition('@')[2]} && "
+            f"claude plugin update {key}",
         )
     return _r(*t, OK, f"{key} installed" + (f" ({version})" if version else ""))
 

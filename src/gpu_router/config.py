@@ -81,7 +81,15 @@ class EngineConfig(_Section):
     internal_error_limit: int = 5  # consecutive engine bugs -> failed
     unknown_quota_reset_s: float = 24 * 3600  # exhausted_until when resets_at unknown
     default_poll_interval_s: float = 15
-    health_recheck_s: float = 900  # re-healthcheck unhealthy providers
+    # Unhealthy providers are re-checked on a backoff: health_recheck_min_s after the first
+    # failed healthcheck, doubling up to health_recheck_s; a healthy answer resets it.
+    health_recheck_s: float = Field(default=900, gt=0)
+    health_recheck_min_s: float = Field(default=60, gt=0)
+    # The health loop wakes at least this often, which is how it notices the Mac woke up
+    # (wall time jumped past the tick); then it waits wake_grace_s for the network before
+    # re-checking every provider.
+    health_tick_s: float = Field(default=30, gt=0)
+    wake_grace_s: float = Field(default=30, ge=0)
     max_workers: int = 16  # adapter worker threads
     per_provider_concurrency: int = 4  # concurrent adapter calls per provider
     timeouts: CallTimeouts = Field(default_factory=CallTimeouts)

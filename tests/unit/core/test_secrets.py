@@ -81,3 +81,17 @@ def test_backend_errors_become_secrets_error() -> None:
     with pytest.raises(SecretsError):
         secrets.set_secret("x", "value-123456")
     assert secrets.redact("value-123456") == "value-123456"  # not stored, not registered
+
+
+def test_child_processes_never_reach_the_macos_keychain() -> None:
+    """Invariant 20 across processes: the in-memory keyring covers only the test process;
+    a daemon subprocess or the real `gpu` executable gets keyring's null backend, so it can
+    neither read a real secret nor show a Keychain prompt (CI runners have no one to click)."""
+    import subprocess
+    import sys
+
+    probe = "import keyring; print(type(keyring.get_keyring()).__module__)"
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert out.stdout.strip() == "keyring.backends.null"

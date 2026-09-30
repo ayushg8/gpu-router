@@ -6,9 +6,13 @@ Startup (`start()`), in order:
    (actor "recovery", detail {"action": RecoveryAction}) and start a JobDriver with
    recovery=statemachine.RECOVERY[state]. No adapter call happens before its driver runs.
 3. Start the provider health loop: healthcheck every registered provider now, then
-   re-check unhealthy ones every config.engine.health_recheck_s; write
+   re-check unhealthy ones on a backoff (config.engine.health_recheck_min_s after the first
+   failure, doubling up to health_recheck_s; a healthy answer resets it); write
    store.upsert_provider_state(...) and log `provider.health`; on a transition back to OK,
-   wake drivers of queued jobs.
+   wake drivers of queued jobs. The loop ticks every health_tick_s; a tick that finds wall
+   time far ahead of the loop's own clock means the Mac slept (asyncio's clock stops while
+   macOS sleeps, D48): it waits wake_grace_s for the network, re-checks every provider and
+   wakes queued drivers.
 4. `ready = True`; log `daemon.recovery` with counts per action.
 
 User actions are methods here (the API calls them on the event loop). Each resolves the
@@ -28,13 +32,16 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import math
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from gpu_router.adapters.base import Capabilities, Health
 from gpu_router.api import ProviderView
-from gpu_router.engine._obs import emit
+from gpu_router.engine._obs import emit, fmt_duration
+from gpu_router.engine.backoff import backoff_s
 from gpu_router.engine.context import build_routing_context, quota_views
 from gpu_router.engine.driver import ADAPTER_FAILURES, JobDriver, remote_ref
 from gpu_router.errors import InvalidSpec, InvalidTransition, StaleState
@@ -43,6 +50,7 @@ from gpu_router.models import (
     JobPatch,
     JobSpec,
     ProviderHealth,
+    ProviderState,
     QuotaSnapshot,
     secret_env_problem,
     secret_names_problem,
@@ -66,6 +74,15 @@ _logger = logging.getLogger("gpu_router.engine.supervisor")
 
 DRY_RUN_JOB_ID = "000000000000"
 
+#: The health loop never sleeps less than this between turns (no busy loop).
+MIN_HEALTH_SLEEP_S = 1.0
+#: Wall time that ran ahead of the loop's own clock by more than this means the Mac slept.
+WAKE_SLACK_S = 60.0
+#: Health states whose view reason says when the health loop looks again.
+_RECHECK_NOTE_HEALTH = frozenset(
+    {ProviderHealth.UNAVAILABLE, ProviderHealth.AUTH_REQUIRED, ProviderHealth.DEGRADED}
+)
+
 _RECOVERY_TEXT: dict[RecoveryAction, str] = {
     RecoveryAction.RESUME: "resuming the queue wait",
     RecoveryAction.REROUTE: "choosing a provider again",
@@ -86,6 +103,9 @@ class Supervisor:
         self._health_task: asyncio.Task[None] | None = None
         self._background: set[asyncio.Task[None]] = set()
         self._stopping = False
+        # health loop bookkeeping (in memory: a restarted daemon checks everything anyway)
+        self._health_failures: dict[str, int] = {}  # consecutive failed healthchecks
+        self._health_next: dict[str, float] = {}  # wall time of the next re-check
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -186,8 +206,11 @@ class Supervisor:
         """A live attempt ended (its provider has a free slot): wake the drivers of queued
         jobs so a job waiting for capacity routes now, not at its next backoff (D44).
         Drivers polling a remote run are left alone (no extra provider calls)."""
+        self._wake_queued(skip=job_id)
+
+    def _wake_queued(self, *, skip: str | None = None) -> None:
         for jid, driver in list(self._drivers.items()):
-            if jid == job_id:
+            if jid == skip:
                 continue
             with contextlib.suppress(Exception):
                 if self.deps.store.get_job(jid).state is JobState.QUEUED:
@@ -196,41 +219,129 @@ class Supervisor:
     # ------------------------------------------------------------------ provider health
 
     async def _health_loop(self) -> None:
+        """Healthcheck every provider now; then re-check unhealthy ones on their backoff,
+        and every provider once the Mac is back from sleep."""
         cfg = self.deps.config.engine
-        first = True
+        clock = self.deps.clock
+        await self._check_many(self.deps.registry.names())
+        offset = clock.now() - clock.monotonic()
         while True:
-            now = self.deps.clock.now()
-            for name in self.deps.registry.names():
-                state = self.deps.store.get_provider_state(name)
-                due = first or (
-                    state.health is not ProviderHealth.OK
-                    and (
-                        state.last_healthcheck_at is None
-                        or now - state.last_healthcheck_at >= cfg.health_recheck_s
-                    )
-                )
-                if due:
-                    try:
-                        await self._check(name)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        emit(
-                            "engine.bug",
-                            f"healthcheck bookkeeping for {name} failed",
-                            level=logging.ERROR,
-                            exc_info=True,
-                            log=_logger,
-                            provider=name,
-                        )
-            first = False
-            await self.deps.clock.sleep(cfg.health_recheck_s)
+            try:
+                delay = self._health_sleep_s()
+            except Exception:
+                self._health_bug("health loop bookkeeping failed")
+                delay = cfg.health_tick_s
+            before = clock.now()
+            await clock.sleep(delay)
+            now = clock.now()
+            # Wall time that passed without the loop's clock: the Mac slept, either during
+            # this sleep (it overran) or during the previous turn's checks (the monotonic
+            # clock stopped while wall time went on).
+            overrun = now - before - delay
+            drift = (now - clock.monotonic()) - offset
+            offset = now - clock.monotonic()
+            try:
+                if now - before > 2 * delay + WAKE_SLACK_S or drift > WAKE_SLACK_S:
+                    await self._after_wake(max(overrun, drift))
+                    offset = clock.now() - clock.monotonic()
+                    continue
+                await self._check_many(n for n in self.deps.registry.names() if self._due(n, now))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._health_bug("health loop turn failed")
+
+    async def _after_wake(self, asleep_s: float) -> None:
+        """The Mac woke up: provider health from before the sleep says nothing about now,
+        and a check made the moment the lid opens usually fails on a network that is not
+        back yet. Give it wake_grace_s, then check every provider with a fresh backoff and
+        let queued jobs route again (their sleeps ran on the stopped clock too)."""
+        cfg = self.deps.config.engine
+        grace = cfg.wake_grace_s
+        emit(
+            "daemon.wake",
+            f"woke from sleep after about {fmt_duration(asleep_s)}; re-checking every "
+            f"provider in {fmt_duration(grace)}, once the network is back",
+            log=_logger,
+            asleep_s=round(asleep_s),
+            grace_s=grace,
+        )
+        self._health_failures.clear()
+        if grace > 0:
+            await self.deps.clock.sleep(grace)
+        await self._check_many(self.deps.registry.names())
+        self._wake_queued()
+
+    def _health_bug(self, msg: str, **fields: object) -> None:
+        emit("engine.bug", msg, level=logging.ERROR, exc_info=True, log=_logger, **fields)
+
+    async def _check_many(self, names: Iterable[str]) -> None:
+        """Healthcheck these providers concurrently (each call is bounded by the caller's
+        timeout, so one slow CLI no longer delays the others)."""
+
+        async def one(name: str) -> None:
+            try:
+                await self._check(name)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self._health_bug(f"healthcheck bookkeeping for {name} failed", provider=name)
+
+        await asyncio.gather(*(one(name) for name in names))
+
+    def _recheck_delay(self, failures: int) -> float:
+        cfg = self.deps.config.engine
+        return backoff_s(
+            max(1, failures),
+            base_s=min(cfg.health_recheck_min_s, cfg.health_recheck_s),
+            cap_s=cfg.health_recheck_s,
+        )
+
+    def _recheck_at(self, name: str, state: ProviderState) -> float:
+        """Wall time of the health loop's next look at an unhealthy provider. A provider a
+        driver marked unhealthy (login needed) has no schedule yet: its first re-check is
+        one short backoff after that; never checked at all = now."""
+        at = self._health_next.get(name)
+        if at is not None:
+            return at
+        if state.last_healthcheck_at is None:
+            return -math.inf
+        return state.last_healthcheck_at + self._recheck_delay(self._health_failures.get(name, 0))
+
+    def _due(self, name: str, now: float) -> bool:
+        state = self.deps.store.get_provider_state(name)
+        return state.health is not ProviderHealth.OK and now >= self._recheck_at(name, state)
+
+    def _health_sleep_s(self) -> float:
+        """Until the next re-check is due, at most one tick (the tick is what notices a
+        wake from sleep), at least MIN_HEALTH_SLEEP_S."""
+        now = self.deps.clock.now()
+        wait = self.deps.config.engine.health_tick_s
+        for name in self.deps.registry.names():
+            state = self.deps.store.get_provider_state(name)
+            if state.health is not ProviderHealth.OK:
+                wait = min(wait, self._recheck_at(name, state) - now)
+        return max(MIN_HEALTH_SLEEP_S, wait)
+
+    def _schedule(self, name: str, health: ProviderHealth, at: float) -> float | None:
+        """Record a healthcheck outcome; return the delay until the next re-check (None =
+        healthy, not re-checked until something fails)."""
+        if health is ProviderHealth.OK:
+            self._health_failures.pop(name, None)
+            self._health_next.pop(name, None)
+            return None
+        failures = self._health_failures.get(name, 0) + 1
+        self._health_failures[name] = failures
+        delay = self._recheck_delay(failures)
+        self._health_next[name] = at + delay
+        return delay
 
     async def _check(self, name: str) -> Health:
         now = self.deps.clock.now()
         try:
             health = await self.deps.caller.healthcheck(name)
         except ADAPTER_FAILURES as exc:
+            # incl. the caller's own timeout: Unavailable("<p> healthcheck timed out after Ns")
             health = Health(
                 health=ProviderHealth.UNAVAILABLE,
                 reason=getattr(exc, "message", str(exc)),
@@ -243,20 +354,43 @@ class Supervisor:
             health_reason=health.reason,
             last_healthcheck_at=health.checked_at or now,
         )
-        if before is not health.health:
+        # a check can take up to its timeout: the backoff counts from its end
+        next_in = self._schedule(name, health.health, self.deps.clock.now())
+        what = f"{name}: {before} -> {health.health}" if before is not health.health else None
+        if what is None and next_in is not None:
+            what = f"{name} is still {health.health}"
+        if what is not None:
             emit(
                 "provider.health",
-                f"{name}: {before} -> {health.health}"
-                + (f" ({health.reason})" if health.reason else ""),
+                what
+                + (f" ({health.reason})" if health.reason else "")
+                + (f"; re-checking in {fmt_duration(next_in)}" if next_in is not None else ""),
+                level=logging.INFO if before is not health.health else logging.DEBUG,
                 log=_logger,
                 provider=name,
                 health=str(health.health),
                 previous=str(before),
                 reason=health.reason,
+                next_check_s=next_in,
             )
-            if health.health is ProviderHealth.OK:
-                self.wake_all()
+        if before is not health.health and health.health is ProviderHealth.OK:
+            self.wake_all()
         return health
+
+    def _health_note(
+        self, name: str, state: ProviderState, now: float
+    ) -> tuple[str | None, float | None]:
+        """The view's reason for an unhealthy provider says when it is looked at again
+        (computed now, so it never goes stale), plus that time for --json readers."""
+        reason = state.health_reason
+        if state.health not in _RECHECK_NOTE_HEALTH:
+            return reason, None
+        at = self._recheck_at(name, state)
+        if not math.isfinite(at):
+            return reason, None
+        when = f"in {fmt_duration(at - now)}" if at - now >= 1 else "now"
+        note = f"re-checking {when}"
+        return (f"{reason}; {note}" if reason else note), at
 
     # ------------------------------------------------------------------ user actions
 
@@ -477,6 +611,7 @@ class Supervisor:
         states = store.all_provider_states()
         quotas = quota_views(self.deps)  # phase 5: the quota ledger's view
         live = store.live_attempts_by_provider()
+        now = self.deps.clock.now()
         views: list[ProviderView] = []
         for entry in registry.catalog.ordered():
             if entry.test_only and not self.deps.config.test_mode:
@@ -487,9 +622,13 @@ class Supervisor:
                 continue
             enabled = entry.name in registry
             state = states.get(entry.name)
+            reason = state.health_reason if state else ("not enabled" if not enabled else None)
+            next_check: float | None = None
             if enabled:
                 caps = registry.get(entry.name).capabilities
                 health = state.health if state else ProviderHealth.UNKNOWN
+                if state is not None:
+                    reason, next_check = self._health_note(entry.name, state, now)
             else:
                 caps = Capabilities(
                     max_session_hours=entry.session_hours,
@@ -504,10 +643,9 @@ class Supervisor:
                     kind=entry.kind,
                     enabled=enabled,
                     health=health,
-                    health_reason=state.health_reason
-                    if state
-                    else ("not enabled" if not enabled else None),
+                    health_reason=reason,
                     state=state,
+                    next_healthcheck_at=next_check,
                     capabilities=caps,
                     gpus=[g.label for g in entry.gpus],
                     session_hours=entry.session_hours,

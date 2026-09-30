@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # gpu-router is macOS-only (launchd, the Keychain, MPS). The tests need no provider
+    # CLI, Keychain entry, ~/.claude or network: real providers are skipped unless
+    # GPU_ROUTER_REAL_PROVIDERS opts in, and child processes get keyring's null backend.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+
+      - name: uv sync
+        run: uv sync --locked
+
+      - name: ruff check
+        run: uv run ruff check src tests
+
+      - name: ruff format
+        run: uv run ruff format --check src tests
+
+      - name: mypy
+        run: uv run mypy
+
+      - name: pytest
+        run: uv run pytest -q

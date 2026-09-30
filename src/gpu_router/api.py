@@ -143,8 +143,10 @@ class ProviderView(_Api):
     kind: str
     enabled: bool
     health: ProviderHealth
-    health_reason: str | None = None
+    health_reason: str | None = None  # an unhealthy one ends with "; re-checking in 40s"
     state: ProviderState | None = None
+    # when the health loop re-checks an unhealthy provider (backoff; None while healthy)
+    next_healthcheck_at: Timestamp | None = None
     capabilities: Capabilities
     gpus: list[str]  # labels, e.g. ["P100", "2xT4"]
     session_hours: float | None = None

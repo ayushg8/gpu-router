@@ -1,0 +1,19 @@
+{
+  "name": "gpu-router",
+  "owner": {
+    "name": "ayushg8",
+    "url": "https://github.com/ayushg8"
+  },
+  "metadata": {
+    "description": "The gpu-router Claude Code plugin, installable straight from GitHub: claude plugin marketplace add ayushg8/gpu-router.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "gpu-router",
+      "source": "./plugin",
+      "description": "Free cloud GPUs for Claude Code through the local gpu-router daemon: MCP tools, skill, slash commands, status line.",
+      "version": "0.1.0"
+    }
+  ]
+}
