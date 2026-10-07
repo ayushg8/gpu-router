@@ -1,6 +1,6 @@
 {
   "name": "gpu-router",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Free cloud GPUs for Claude Code: an MCP server (gpu_submit, gpu_status, gpu_logs, gpu_fetch, gpu_cancel, gpu_quota, gpu_route, plus gpu_infer for free LLM inference), the gpu-router skill, /gpu-run /gpu-status /gpu-approve /gpu-statusline, and the status-line wrapper (statusline/gpu-statusline.sh, added with `gpu statusline install`). Needs the `gpu` command on PATH.",
   "author": {
     "name": "ayushg8",

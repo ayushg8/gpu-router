@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from gpu_router import __version__
 from gpu_router.api import VERSION_HEADER, EventList, JobDetail, JobList, JobView, StatusView
 from gpu_router.daemon import routes
 from tests.api.conftest import BASE_URL, Api
@@ -25,7 +26,7 @@ async def test_health_is_public_and_versioned(api: Api) -> None:
     assert body["test_mode"]
     assert body["pid"] == os.getpid()
     assert body["started_at"].endswith("Z")
-    assert resp.headers[VERSION_HEADER] == "0.1.0"
+    assert resp.headers[VERSION_HEADER] == __version__
     # the daemon's own notification backend (doctor reports it; review fix)
     assert body["notifications"] in (None, "off: running under pytest")
 

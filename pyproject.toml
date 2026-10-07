@@ -1,6 +1,6 @@
 [project]
 name = "gpu-router"
-version = "0.1.0"
+version = "0.2.0"
 description = "Routes GPU jobs across free-tier cloud providers behind one local daemon."
 readme = "README.md"
 license = "MIT"

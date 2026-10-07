@@ -4,4 +4,4 @@ Invariant 15: this file imports nothing. `gpu status --line` imports the package
 <50ms fast path, so any import added here is paid by every status-line render.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
