@@ -301,6 +301,12 @@ class ScoringRouter:
             return Rejection(
                 provider=name, code=RejectCode.EXCLUDED, reason=f"{name}: rejected this job earlier"
             )
+        if name in ctx.data_unreachable:
+            return Rejection(
+                provider=name,
+                code=RejectCode.EXCLUDED,
+                reason=f"{name}: {ctx.data_unreachable[name]}",
+            )
         if st.health is ProviderHealth.DISABLED:
             return Rejection(provider=name, code=RejectCode.DISABLED, reason=f"{name}: disabled")
         if st.health is ProviderHealth.AUTH_REQUIRED:

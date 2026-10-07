@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +42,7 @@ from gpu_router.adapters.base import (
     LogChunk,
     RemoteRef,
     RemoteStatus,
+    StagedData,
 )
 from gpu_router.engine._obs import emit
 from gpu_router.errors import AdapterContractViolation, AdapterError, Unavailable
@@ -324,6 +325,21 @@ class AdapterCaller:
 
         return await self._call(
             provider, "healthcheck", fn, timeout_s=self.config.timeouts.healthcheck
+        )
+
+    async def stage_data(
+        self, provider: str, path: Path, sha256: str, files: Sequence[tuple[str, int]]
+    ) -> StagedData:
+        adapter = self.registry.get(provider)
+        listed = tuple(files)
+
+        def fn() -> StagedData:
+            out = adapter.stage_data(path, sha256, listed)
+            _expect(out, StagedData, "StagedData")
+            return out
+
+        return await self._call(
+            provider, "stage_data", fn, timeout_s=self.config.timeouts.stage_data
         )
 
     async def lookup_by_key(self, provider: str, attempt_key: str) -> RemoteRef | None:

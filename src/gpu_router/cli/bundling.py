@@ -23,7 +23,9 @@ def preview(spec: JobSpec) -> dict[str, Any] | None:
 
     Shape (docs/cli.md): {sha256, file_count, size_bytes, code_bytes, cached, deps: {kind,
     file, packages, python_requires}, estimate: {vram_gb, hours, vram_source, hours_source,
-    mode, reasons}, warnings: [str]}.
+    mode, reasons}, warnings: [str]}, plus (D60) `included` {files, bytes} when the spec has
+    `include:`, and `left_out` [str] + `left_out_not_shown` + `hint` when ignored paths do
+    not ship.
     """
     try:
         mod = importlib.import_module("gpu_router.packaging")
@@ -35,7 +37,7 @@ def preview(spec: JobSpec) -> dict[str, Any] | None:
     bundle = build(spec.project_dir, spec)
     deps = bundle.deps
     est = bundle.estimate
-    return {
+    out: dict[str, Any] = {
         "sha256": bundle.sha256,
         "file_count": bundle.file_count,
         "size_bytes": bundle.size_bytes,
@@ -57,3 +59,12 @@ def preview(spec: JobSpec) -> dict[str, Any] | None:
         },
         "warnings": list(bundle.warnings),  # already includes deps warnings
     }
+    sel = getattr(bundle, "selection", None)
+    if sel is not None:
+        from gpu_router.packaging.bundle import left_out_view
+
+        if spec.include:
+            out["included"] = {"files": len(sel.included), "bytes": sel.included_bytes}
+        data_paths = [d.path for d in spec.data if d.path]
+        out.update(left_out_view(spec.project_dir, sel, spec.include, data_paths))
+    return out

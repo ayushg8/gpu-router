@@ -9,6 +9,7 @@ from gpu_router.packaging.bundle import (
     BundleError,
     BundleTooLarge,
     build_bundle,
+    bundle_summary,
     materialize,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "BundleError",
     "BundleTooLarge",
     "build_bundle",
+    "bundle_summary",
     "materialize",
 ]

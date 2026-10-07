@@ -116,10 +116,10 @@ real code; everything else has signatures + docstrings and `NotImplementedError`
 | `daemon/launchd.py` | launchd plist writer / load / unload | 1 | C |
 | `daemon/spawn.py` | background start + wait for `/v1/health` (CLI auto-start, `gpu daemon start`); watches the spawned child (early exit = fail fast with its launchd.log line; exit 3 = lost the start race, keep waiting, `started=False`) | 2 | - |
 | `client.py` | sync HTTP client used by CLI, shell, MCP (submit: 300 s timeout, retries only connections that never reached the daemon, else `SubmitUncertain`) | 1 | C |
-| `packaging/files.py` | which files ship: `git ls-files -co --exclude-standard -t` (untracked ones named in a warning), walk only when no `.git` ancestor, `GitError` when git fails inside a repo, credential deny list (names, dirs, symlink targets), outside-project symlinks refused | 2 | - |
+| `packaging/files.py` | which files ship: `git ls-files -co --exclude-standard -t` (untracked ones named in a warning), walk only when no `.git` ancestor, `GitError` when git fails inside a repo, credential deny list (names, dirs, symlink targets), outside-project symlinks refused; `include:` patterns (`normalize_include`, `IncludeError`) ship ignored paths through the same rules, `left_out` names what git ignores, cheaply (D60) | 2 | - |
 | `packaging/deps.py` | `DepsSpec` -> `DepsInfo` (requirements.txt / pyproject deps parsed with tomllib / none); `[tool.uv.sources]` git/url -> PEP 508 direct refs, in-project path -> `./path`, index -> warning, others -> `DepsError` | 2 | - |
 | `packaging/estimate.py` | VRAM + hours heuristics (labelled spec/heuristic, with reasons) | 2 | - |
-| `packaging/bundle.py` | `build_bundle`, deterministic tar.gz + sha256 (fsynced), cache `bundles/<sha>.tar.gz` (a rebuild always replaces the entry), `materialize`, `BundleBuilder` | 2 | - |
+| `packaging/bundle.py` | `build_bundle`, deterministic tar.gz + sha256 (fsynced), cache `bundles/<sha>.tar.gz` (a rebuild always replaces the entry), `materialize`, `BundleBuilder`; `bundle_summary` = what ships + `left_out` without the archive, for gpu_submit/gpu_route (D60) | 2 | - |
 | `jobspec.py` | gpu.yaml schema v1 (validation errors with file:line + hint), project root, gpu.yaml + flags merge -> JobSpec; strict env intake check (D39) | 2 | - |
 | `cli/app.py` | Typer commands (run, route, status, jobs, history, logs, cancel, approve, deny, fetch, quota, providers, secrets, daemon), `split_run_argv` (D23), `main(argv)` (catches both click copies, D24); `run --data` merge (`_with_data`, phase 5) | 2 | - |
 | `cli/render.py` | rich output: visual language (⚡ ⏸ ✓ ✗ ↪, green/yellow/red/dim), tables, empty states | 2 | - |
@@ -615,6 +615,7 @@ Adding a provider = adapter + `providers.yaml` entry + passing `tests/contract/`
 | `quota()` | `QuotaSnapshot` | used, limit, resets_at, source live/estimate |
 | `healthcheck()` | `Health` | ok or the reason not |
 | `lookup_by_key(key)` | `RemoteRef or None` | crash recovery; only if `capabilities.lookup_by_key` |
+| `stage_data(path, sha256, files)` | `StagedData` {uri, uploaded, where} | a `data:` dataset kept in the provider's own store, once per content (D61); only if `capabilities.stage_data`; bounded below `engine.timeouts.stage_data` (3600) |
 
 Rules: **A1** implement all calls above; declare `Capabilities` honestly. **A2** methods are
 blocking and run in worker threads; bound every subprocess/network call below
@@ -2072,3 +2073,100 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   locked deps, ruff / format / mypy passed, pytest 2582 passed, 28 skipped in 6m32s (the 5
   skips beyond the dev machine's 23 are environmental: no Python 3.8, no ~/.claude/settings.json,
   3 real-SDK-shape checks with the pinned lightning-sdk absent from uv's offline cache).
+- **D60** (field test 2026-10-04: agents were surprised that git-ignored `third_party/`,
+  `data/...` crops and `experiments/**/out/` never reached the GPU, and nothing told them)
+  (1) `JobSpec.include` (additive, `exclude_if` empty: a spec without it dumps and hashes
+  exactly as before and an older daemon still accepts it): paths or globs relative to the
+  project root, normalized + deduplicated by the validator (`files.normalize_include`:
+  absolute, `~`, `..`, `.` / `**` alone refused; <= 64 entries). gpu.yaml `include:`
+  (string or list), `gpu run --include` (repeatable, before the script only, D23), shell
+  `/run --include`, MCP `include` on gpu_submit / gpu_route; flags and tool args add to the
+  file's. (2) `select_files(project, include)`: `*` stays in one dir, `**` spans dirs, a
+  trailing `/` = dirs only, a matching dir ships whole; walks only real dirs (a pattern
+  through a symlink warns), never enters dirs that cannot match (`*.ckpt` skips data/),
+  skips VCS dirs (an entry naming `.git/...` warns and ships nothing), virtualenvs (`.venv`,
+  `venv`, any dir with `pyvenv.cfg`: a field-test project's third_party clone had one with 50k+ files),
+  node_modules, tool caches and `*.pyc`, prunes credential dirs, stops at
+  `MAX_INCLUDE_FILES` (50k: BundleError, hint `data:`). Every match goes through the same
+  `_classify` as git's listing (deny list, symlink targets, outside-project refusal) and
+  counts toward the 200 MB cap (the hint names include's share); a nested repo git lists
+  only as a whole now ships its files; zero-match entries warn; include warnings are sorted
+  so the archive never depends on pattern order. Manifest `files.included` {count, bytes}.
+  (3) `bundle.bundle_summary(spec)`: the same selection without the archive plus
+  `files.left_out`: `git ls-files -o -i --exclude-standard --directory` (ignored dirs
+  collapsed, never walked), nested repos / dir symlinks from the selection, the walk's
+  default-skipped dirs in a non-git project; venvs, caches, `runs/`, build output and
+  credential-looking paths are never named, paths an include entry covers are dropped,
+  sizes within a 5k-entry budget per path (20k in all, else "N+ files"), more than 8
+  grouped by top dir. gpu_route and a creating gpu_submit return it as `bundle` {files,
+  bytes, size, included?, left_out?, left_out_not_shown?, hint?, warnings? (<= 6, 300
+  chars)}; `gpu run --dry-run`'s Bundle gains `included` / `left_out` / `hint` and a `left
+  out:` line. Computed client-side (MCP server, CLI), not by the daemon: the engine was
+  being edited in parallel and POST /v1/jobs has no field for it (D22's open point stays
+  open). `left_out` is deliberately not in the manifest: ignored dirs like `runs/` change
+  with every job and would change every bundle's sha. (4) SKILL.md and the Codex section
+  (sync test in `tests/unit/test_plugin.py`), the MCP instructions / descriptions and
+  docs/cli.md say: ignored files do not ship, read `bundle.left_out`, use `include` or
+  `data`; and `provider="local"` runs on this Mac through gpu-router's one-at-a-time queue
+  (max_concurrency 1), while unpinned the Mac takes only smoke tests (D41). Tests:
+  `tests/unit/packaging/test_include.py`, `tests/unit/cli/test_include_flags.py`,
+  `tests/mcp/test_include_bundle.py`, `tests/cli/test_include_cli.py`.
+- **D61** (field test 2026-10-04, `docs/notes/field-test-2026-10-04.md`: 6 Kaggle jobs, 0
+  ran) (1) **Kaggle's SaveKernel refuses a code file over ~1 MB** (probed live: 933,761 B
+  pushed, 1,141,256 B `400 Bad Request`); the phase-3 inline limit (10 MB, marked [I]) was
+  never true, so every bundle over ~700 KB failed. run.py stays under
+  `remote.MAX_INLINE_SOURCE` (900,000 B); a bigger bundle or resume archive travels as a
+  private content-addressed dataset `<user>/gpu-router-{bundle,ckpt}-<sha16>` (one `.bin`,
+  `dataset_sources`, sha256-checked by run.py, mount `/kaggle/input/datasets/<owner>/
+  <slug>/` seen live), uploaded once inside submit's 270 s budget and reused by later
+  attempts and jobs (`_ensure_blob`, records in `providers/kaggle/blobs/`; 403 right after
+  a create = not visible yet). A `400 Client Error` from the push is InvalidJob (nothing was
+  saved): no provider cooldown, a pinned job fails at once with the reason (was "outcome
+  unknown": cooldowns of 2-30 min and 6 retries). Settings `blob_datasets` (true),
+  `max_bundle_mb` (100), `data_keep_days` (30); a background sweep deletes blobs unused for
+  3 days (bundle/ckpt) or data_keep_days. (2) **Optional adapter call `stage_data`**
+  (`Capabilities.stage_data`, `StagedData`, `AdapterCaller.stage_data`, config
+  `engine.timeouts.stage_data` 3600, all additive): with no HF storage for the attempt the
+  driver digests a `data:` path and asks the adapter to keep it; Kaggle stores a directory
+  as one uncompressed tar (`data-<sha16>.tar.bin`, extracted by run.py under
+  /tmp/gpu-router/data-src/) and a file as itself, GPU_DATA gets `kaggle://<owner>/<slug>/
+  <file>` which run.py rewrites to `local` items for bootstrap. Reused by content hash
+  across jobs (the cross-job cache for weights the field-test jobs re-downloaded per retry).
+  Transient trouble = `_StagePending` (a StorageError: waits up to
+  checkpoint.storage_wait_s, then excludes), refusals exclude the provider. New Reason
+  `data_uploading` (note, only for datasets >= 50 MB); `data_uploaded`/`data_reused` say
+  where. (3) **Routing knows where data can go**: `RoutingContext.data_unreachable`
+  (additive) names providers a job's local `data:` paths cannot reach (no HF storage by the
+  hub's cached state, `CheckpointHub.remote_data_possible`, and no stage_data); both
+  routers reject them as EXCLUDED with that reason, and an all-excluded no-fit names it
+  (`gpu_route` with data had picked colab, which would have been excluded at submit). (4)
+  `gpu providers`: notes print under the table (an 80-column pipe squeezed the 7th column
+  to 4 chars a line) and a cooldown is named ("cooling down for 27m00s after 3 failed
+  calls in a row"). (5) MCP polling results (gpu_status / gpu_fetch, not verbose) carry a
+  brief spec (`SPEC_BRIEF`) without spec_hash / bundle_sha256 (~25% of each poll), and
+  `poll_every_s` never exceeds the 50 s wait_s cap when follow is `wait`. The bundle
+  summary does not list a path the job passes as `data=` as left out (a parent dir gets
+  "; data/rows/ is passed as data="). (6) Skill + Codex section: weights and datasets
+  used every run go in `data`. Verified live: adapter-level 1.5 MB bundle + staged data on
+  real Kaggle 2xT4 (done in 90 s, metrics fetched); a separate headless Claude Code
+  session (Sonnet, MCP tools only, private daemon on a tmp home) ran 5 runs: Kaggle with
+  data twice (second reused the upload), Colab, local MPS through the queue, a route:
+  all done, $0.80. Not verified live: a Kaggle resume archive over the limit, the sweep
+  against the real API, a big (GB) data upload. (7) Independent review fixes (6 findings,
+  all fixed): `remote_data_possible` is True while HF is down for a reason that should
+  pass (the placement waits, D44) and again once a refusal's pause ends (only placements
+  call hf(), so a new `gpu login hf` would never count), and False while remote runners
+  have no HF_TOKEN_REMOTE (`_remote_missing_at`, re-checked after RETRY_PERMANENT_S);
+  `_stage_on_provider` treats AdapterContractViolation like Unavailable (invariant 7) and
+  applies AuthRequired as a definitive submit error (provider health, requeue) instead of
+  excluding the provider; Kaggle blob trouble before the push is RateLimited
+  (`BLOB_RETRY_S` 60: definitive, no ambiguous lookup, no outage cooldown); the sweep
+  re-reads a record under its blob lock and counts `uploading_at` as use; blobs off + a
+  big resume archive = fresh start with a note (not InvalidJob); OSErrors while packing
+  are Unavailable (A3). (8) Real use after the fix (a user project, 2026-10-05): 6 jobs done
+  on Kaggle (12-36 min each), 0 before. One fetch hit a transient network error and the
+  agent's `gpu_fetch` retry got all 781 files, but the stored `fetch_failed` note carried
+  Kaggle's signed download URL: a JWE (`eyJ...` with an empty second part) no pattern knew.
+  `secrets.TOKEN_PATTERNS` now redacts JWT/JWE, and the driver's `_err_text` redacts every
+  adapter error text it stores (invariant 12, defence in depth). The note already stored
+  holds an expired link and stays (events are append-only).

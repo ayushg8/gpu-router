@@ -13,7 +13,7 @@ placement event's detail).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from typing import Literal, Protocol
 
@@ -71,6 +71,9 @@ class RoutingContext(_Frozen):
     now: float
     providers: Sequence[ProviderSnapshot]  # registered (enabled) providers, catalog order
     excluded: frozenset[str] = frozenset()  # store.excluded_providers(job.id)
+    # providers the job's data= paths cannot reach, with why (no HF storage and no
+    # adapter.stage_data; 2026-10-04 field test: colab was chosen, then excluded at submit)
+    data_unreachable: Mapping[str, str] = Field(default_factory=dict)
     previous_provider: str | None = None  # provider of the last attempt (migration)
     resuming: bool = False  # a checkpoint exists and will be resumed
     estimate: JobEstimate | None = None  # phase 5: bundle estimate (None = spec only)

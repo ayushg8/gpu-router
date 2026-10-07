@@ -35,12 +35,25 @@ do not submit jobs with the `gpu` CLI instead.
     it, or over 1 hour, wait for the user's approval, and a job still running well past
     its hours (1.5x, at least 15 min over) is stopped and waits for approval.
   - Optional: `vram_gb` (hard minimum), `gpu` (e.g. T4), `env` (non-secret vars),
-    `data` (`[NAME=]PATH` datasets, uploaded once and cached), `name`, `smoke`.
-  - Leave `provider` unset unless the user asked for one.
+    `data` (`[NAME=]PATH` datasets, uploaded once and cached), `include` (see below),
+    `name`, `smoke`.
+  - Leave `provider` unset unless the user asked for one. To run on this Mac through
+    gpu-router's queue (one job at a time, so parallel agents do not fight over the GPU),
+    pin `provider="local"`; unpinned, the Mac only takes smoke tests.
+  - Big files the job needs every run (model weights, datasets) go in `data`, not in a
+    download inside the script: Kaggle keeps each one as a private dataset, uploaded once
+    and reused by every later job (re-downloading 7 GB from Google Drive per retry got
+    rate-limited). Without Hugging Face storage only Kaggle and this Mac can take `data`;
+    the router knows and picks accordingly.
   - Safe to retry: the same call while that job is still active returns it
     (`submitted: false`) instead of starting a second copy.
 - Preview first with `gpu_route(...)` (same arguments) for long or big-VRAM jobs: it
   shows where the job would go, why, and whether approval would be needed.
+- **Git-ignored files do not ship.** Both results carry `bundle`: files and bytes that
+  ship, and `bundle.left_out` = ignored paths that do not (`data/ (2.1 GB, ignored)`,
+  `third_party/ (ignored)`). If the job needs one, pass `include=["third_party/"]` (code,
+  small files; globs like `experiments/**/out` work; nested git repos ship too) or
+  `data=[...]` (datasets). Check with `gpu_route` before submitting.
 
 `gpu.yaml` at the project root holds defaults; tool arguments and flags override it:
 
@@ -55,10 +68,12 @@ secrets: [WANDB_API_KEY]      # Keychain names, set with `gpu secrets set NAME`
                               #   (agent jobs that read secrets ask the user first)
 data:
   - {mount: coco, path: data/coco}
+include: [third_party/]       # ship these although git ignores them
 ```
 
 Dependencies come from `requirements.txt` or `pyproject.toml` automatically. Git-tracked
-and untracked-but-not-ignored files ship; `.env`, keys and credential files never do.
+and untracked-but-not-ignored files ship, ignored ones only through `include`; `.env`,
+keys and credential files never do.
 Never put secrets in `env`: store them with `gpu secrets set NAME` (the user runs it) and
 list the name under `secrets:`.
 

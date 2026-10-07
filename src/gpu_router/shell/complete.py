@@ -45,7 +45,7 @@ _VALUE_FLAGS = {
     "--timeout",
 }
 _PROVIDER_FLAGS = {"--provider", "-p"}
-_PATH_FLAGS = {"--data"}  # [NAME=]PATH: any file or directory
+_PATH_FLAGS = {"--data", "--include"}  # [NAME=]PATH / include path: any file or dir
 POLICY_SUBCOMMANDS = (
     ("show", "the rules in force"),
     ("set", "KEY VALUE  change one rule"),

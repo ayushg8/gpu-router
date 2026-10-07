@@ -99,6 +99,9 @@ def test_rejected_credentials_are_auth_not_an_outage(fake: Fake) -> None:
     fake.write({**fake.state(), "raise": {"whoami": {"type": "AuthFailed"}}})
     res = fake.call("whoami")
     assert (res.kind, res.status) == ("auth", 401)
+    # gpu-router keeps its own key: the SDK's "run `lightning login`" alone fixes nothing
+    assert "`lightning login`" not in str(res.error)
+    assert "sign in again with `gpu login lightning`" in str(res.error)
 
 
 def test_without_credentials_the_sdk_is_never_imported(fake: Fake) -> None:

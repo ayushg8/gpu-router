@@ -458,6 +458,7 @@ async def test_without_a_token_remote_runs_degrade_with_a_message(
     await ceng.run_until(lambda: is_terminal(ceng.job(job2.id).state), step=1)
     failed = ceng.job(job2.id)
     assert failed.state is JobState.FAILED  # both fakes are remote here: nowhere to run
-    excluded = [e.message for e in ceng.notes(job2.id, Reason.PROVIDER_EXCLUDED)]
-    assert excluded
-    assert all("needs Hugging Face storage" in m for m in excluded)
+    # refused at routing (2026-10-04 field test), not one burned attempt per provider
+    assert ceng.store.attempts_for(job2.id) == []
+    (gave_up,) = ceng.notes(job2.id, Reason.NO_PROVIDER_FITS)
+    assert "fake: cannot receive data= without Hugging Face storage" in gave_up.message

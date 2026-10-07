@@ -39,6 +39,9 @@ TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"ak-[A-Za-z0-9]{20,}|as-[A-Za-z0-9]{20,}"),  # Modal token id / secret
     re.compile(r"gsk_[A-Za-z0-9]{20,}"),  # Groq (phase 7b inference lane)
     re.compile(r"AIza[0-9A-Za-z_-]{35}"),  # Google API key (Gemini, phase 7b)
+    # JWT / JWE (signed download URLs: Kaggle's kernels output links carry a JWE whose
+    # second part is empty, seen in a fetch error on 2026-10-05)
+    re.compile(r"\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*){1,4}"),
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"),
     re.compile(r"(?i)((?:kaggle_key|api_key|token|secret|password)\s*[=:]\s*)[^\s\"',}]+"),
     re.compile(r"(?i)(\"key\"\s*:\s*\")[0-9a-f]{32}(\")"),  # kaggle.json shape

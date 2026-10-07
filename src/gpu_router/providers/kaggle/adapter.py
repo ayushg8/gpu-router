@@ -36,6 +36,15 @@ Contract notes (CLAUDE.md "Adapter contract"):
   running 2xT4 kernel stopped its GPU quota accrual at once (NOTES.md "Live runs"). Every
   push also carries a session timeout (-t) so a run can never outlive its budget.
 - quota: live from `kaggle quota --format json` (GPU row).
+- large payloads (2026-10-04): SaveKernel refuses a code file over ~1 MB (probed live,
+  remote.MAX_INLINE_SOURCE), so a bundle or resume archive that would push run.py past it
+  travels as a private content-addressed dataset `<user>/gpu-router-<kind>-<sha16>`
+  (`_ensure_blob`, reused by later attempts and jobs; records in
+  <home>/providers/kaggle/blobs/), and `stage_data` puts `data:` datasets there too when
+  no checkpoint storage exists (one tar per directory, the file itself for a file).
+  Unused blobs are deleted by a background sweep (bundle/ckpt after 3 days, data after
+  `data_keep_days`, default 30). A `400 Bad Request` from SaveKernel is definitive
+  (InvalidJob): the server refused the save, nothing was created.
 - secrets (phase 5): CLI-pushed kernels have no secrets field and run.py is kept in version
   history, so values travel in a private dataset `<user>/gpu-router-secrets` (settings
   `providers.kaggle.secrets_dataset`, false = refuse jobs with secrets) attached through
@@ -52,10 +61,11 @@ import json
 import os
 import re
 import shutil
+import tarfile
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -71,6 +81,7 @@ from gpu_router.adapters.base import (
     RemotePhase,
     RemoteRef,
     RemoteStatus,
+    StagedData,
 )
 from gpu_router.checkpoint import sidechannel
 from gpu_router.errors import (
@@ -106,7 +117,10 @@ GPU_SHAPES: dict[str, str] = {"T4": "NvidiaTeslaT4", "P100": "NvidiaTeslaP100"}
 SHAPE_LABELS: dict[str, str] = {"NvidiaTeslaT4": "2xT4", "NvidiaTeslaP100": "P100"}
 DEFAULT_GPU = "T4"
 INSTALL_FAILED_EXIT = 90  # runner/bootstrap.py: dependency install failed, job never ran
-DEFAULT_MAX_EMBED_MB = 10.0  # bundle size that rides inside run.py ([I] limit, NOTES.md)
+# Bundles up to this size reach a kernel (inline in run.py below remote.MAX_INLINE_SOURCE,
+# else as a blob dataset uploaded inside submit's budget). Was 10 MB inline, which Kaggle
+# never accepted: SaveKernel refuses a source over ~1 MB (probed 2026-10-04).
+DEFAULT_MAX_BUNDLE_MB = 100.0
 SESSION_MARGIN_S = 300  # push -t = session cap minus this
 MIN_TIMEOUT_S = 60
 CHUNK_LINES = 1000
@@ -144,6 +158,21 @@ SECRETS_READY_POLLS = 6
 SECRETS_READY_PAUSE_S = 5.0
 T_PUSH_AFTER_SECRETS = 90.0
 EMPTY_LOG_GRACE_S = 600.0  # a finished kernel's empty log is "not published yet" this long
+# Blob datasets (2026-10-04). submit() spends at most SUBMIT_BUDGET_S (engine 300) across
+# every call incl. blob uploads; a push gets what is left, at least MIN_PUSH_S.
+# stage_data() spends at most T_STAGE_TOTAL (engine timeouts.stage_data 3600).
+SUBMIT_BUDGET_S = 270.0
+MIN_PUSH_S = 45.0
+T_STAGE_TOTAL = 3300.0
+T_BLOB_STATUS = 15.0
+BLOB_READY_PAUSE_S = 5.0
+BLOB_UPLOAD_GRACE_S = 900.0  # a fresh upload may read 403/404 this long before it shows
+BLOB_MAX_TIMEOUTS = 2  # a resume archive that timed out this often: start fresh instead
+BLOB_SWEEP_EVERY_S = 6 * 3600.0
+BLOB_SWEEP_MAX = 10  # deletes per sweep
+BLOB_KEEP_DAYS = {"bundle": 3.0, "ckpt": 3.0, "data": 30.0}
+BLOB_SWEEP = True  # tests switch the background sweep off
+BLOB_RETRY_S = 60  # retry_after when blob trouble stopped a submit before its push
 
 _JOB_OPTIONS = {"timeout_s", "accelerator", "enable_internet"}
 _TIME_LIMIT_MARKERS = (
@@ -170,6 +199,9 @@ _LOCAL_PUSH_ERRORS = (
     "invalid kernel",
     "invalid model",
 )
+_BLOB_REF = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/gpu-router-(?:bundle|ckpt|data)-[0-9a-f]{16}$"
+)
 _SAFE_REF = re.compile(
     r"^([A-Za-z0-9][A-Za-z0-9_.-]{0,63})/(gpu-router-[0-9a-f]{6,32}-[0-9]{1,4})$"
 )
@@ -186,6 +218,23 @@ def _atomic_write(path: Path, data: str) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_size(source: Path, files: Sequence[tuple[str, int]] | None) -> int:
+    if files is not None:
+        return sum(size for _rel, size in files)
+    try:
+        return source.stat().st_size
+    except OSError:
+        return 0
 
 
 OFFLINE_REASON = "real kaggle calls are off in test mode"
@@ -226,8 +275,9 @@ class KaggleAdapter(Adapter):
         cancel_confirms=True,
         live_quota=True,
         max_session_hours=12,
-        max_bundle_mb=DEFAULT_MAX_EMBED_MB,
+        max_bundle_mb=DEFAULT_MAX_BUNDLE_MB,
         poll_interval_s=60,
+        stage_data=True,
     )
 
     def __init__(self, deps: AdapterDeps, *, runner: Runner | None = None) -> None:
@@ -236,7 +286,17 @@ class KaggleAdapter(Adapter):
         self._configured_user: str | None = extra.get("username") or None
         self._cli_path: str | None = extra.get("cli_path") or None
         self._cred_mode = str(extra.get("credentials") or "auto")
-        self._max_embed_mb = float(extra.get("max_embed_mb") or DEFAULT_MAX_EMBED_MB)
+        self._max_bundle_mb = float(
+            extra.get("max_bundle_mb") or extra.get("max_embed_mb") or DEFAULT_MAX_BUNDLE_MB
+        )
+        self._blobs = extra.get("blob_datasets", True) not in (False, "false", "off", 0)
+        keep = dict(BLOB_KEEP_DAYS)
+        with contextlib.suppress(TypeError, ValueError):
+            keep["data"] = float(extra.get("data_keep_days") or keep["data"])
+        self._blob_keep_s = {k: v * 86400.0 for k, v in keep.items()}
+        self._blob_locks: dict[str, threading.Lock] = {}
+        self._last_sweep = -1e18
+        self._sweep_thread: threading.Thread | None = None
         self._internet = bool(extra.get("enable_internet", True))
         raw_ds = extra.get("secrets_dataset", remote.SECRETS_DATASET_SLUG)
         self._secrets_slug: str | None = (
@@ -251,8 +311,9 @@ class KaggleAdapter(Adapter):
             live_quota=True,
             max_session_hours=deps.entry.session_hours,
             max_concurrency=deps.entry.max_concurrency,
-            max_bundle_mb=self._max_embed_mb,
+            max_bundle_mb=self._max_bundle_mb,
             poll_interval_s=deps.entry.poll_interval_s,
+            stage_data=self._blobs,
         )
         self._lock = threading.Lock()
         self._username: str | None = None
@@ -410,25 +471,19 @@ class KaggleAdapter(Adapter):
             ) from None
         return max(MIN_TIMEOUT_S, min(value, limit))
 
-    def _resume_payload(self, ctx: AttemptContext) -> tuple[bytes | None, str | None, str | None]:
-        """(archive bytes, sha256, note). Only checkpoints that are files on this Mac can
-        travel today (phase 5 moves checkpoints through HF Hub)."""
+    def _resume_source(self, ctx: AttemptContext) -> tuple[Path | None, str | None]:
+        """(archive on this Mac, note). Only checkpoints that are files on this Mac can
+        travel without checkpoint storage; they go inline or as a blob dataset."""
         ckpt = ctx.resume_from
         if ckpt is None:
-            return None, None, None
+            return None, None
         if str(ctx.env.get("GPU_RESUME_URI") or "").startswith("hf://"):
-            return None, None, None  # phase 5: the runner downloads it from the bucket
+            return None, None  # phase 5: the runner downloads it from the bucket
         parsed = urlparse(ckpt.uri)
         path = Path(unquote(parsed.path)) if parsed.scheme == "file" else None
         if path is not None and path.is_file():
-            data = path.read_bytes()
-            if len(data) <= self._max_embed_mb * 1024 * 1024:
-                return data, hashlib.sha256(data).hexdigest(), None
-        return (
-            None,
-            None,
-            f"checkpoint {ckpt.seq} ({ckpt.uri}) cannot reach kaggle yet; starting fresh",
-        )
+            return path, None
+        return None, f"checkpoint {ckpt.seq} ({ckpt.uri}) cannot reach kaggle yet; starting fresh"
 
     def _marker(self, key: str) -> Path:
         return self._dir("submits") / f"{key}.json"
@@ -475,13 +530,16 @@ class KaggleAdapter(Adapter):
         archive = ctx.bundle_archive
         if archive is None or not archive.is_file():
             raise InvalidJob("the job has no bundle to send to kaggle", provider=self.name)
+        deadline = self.clock.monotonic() + SUBMIT_BUDGET_S
         size = archive.stat().st_size
-        if size > self._max_embed_mb * 1024 * 1024:
+        cap_mb = self._max_bundle_mb if self._blobs else remote.MAX_INLINE_SOURCE * 3 / 4 / 1e6
+        if size > cap_mb * 1e6:
             raise InvalidJob(
-                f"bundle is {size / 1e6:.1f} MB; kaggle takes up to {self._max_embed_mb:g} MB",
+                f"bundle is {size / 1e6:.1f} MB; kaggle takes up to {cap_mb:g} MB",
                 provider=self.name,
-                hint="ship data through HF Hub or /data instead of the project folder",
+                hint="pass big files as data= (datasets) instead of shipping them as code",
             )
+        data_refs = self._data_refs(ctx)
 
         # Idempotency (A4): a marker from an earlier push, else the kernel itself.
         marker = self._marker(key)
@@ -509,30 +567,30 @@ class KaggleAdapter(Adapter):
         if shape is not None:
             self._quota_precheck()
 
-        bundle = archive.read_bytes()
-        resume, resume_sha, resume_note = self._resume_payload(ctx)
-        seq_start = ctx.resume_from.seq + 1 if ctx.resume_from is not None else 1
-        runner_py = remote.render_runner(
-            attempt_key=key,
-            bundle=bundle,
-            bundle_sha256=hashlib.sha256(bundle).hexdigest(),
-            env=dict(ctx.env),
-            ckpt_seq_start=seq_start,
-            checkpoint_interval_min=ctx.checkpoint_interval_min,
-            resume=resume,
-            resume_sha256=resume_sha,
-            resume_note=resume_note,
-            secrets_dataset=secrets_ref,
-        )
+        try:
+            runner_py, blob_refs, blob_uploaded = self._runner_source(
+                owner, key, ctx, archive, secrets_ref, deadline
+            )
+        except Unavailable as exc:
+            raise self._retry_soon(exc.message, exc.hint) from None
+        uploaded = uploaded or blob_uploaded
         internet = bool(opts.get("enable_internet", self._internet))
+        sources = [r for r in [secrets_ref, *blob_refs, *data_refs] if r]
         meta = remote.kernel_metadata(
             owner=owner,
             slug=slug,
             title=remote.kernel_title(key),
             machine_shape=shape,
             enable_internet=internet,
-            dataset_sources=[secrets_ref] if secrets_ref else None,
+            dataset_sources=list(dict.fromkeys(sources)) or None,
         )
+        push_s = min(T_PUSH_AFTER_SECRETS if uploaded else T_PUSH, self._left(deadline) - 25)
+        if push_s < MIN_PUSH_S:
+            raise self._retry_soon(
+                "kaggle submit ran out of time uploading its datasets (they are kept and "
+                "reused); gpu-router submits again shortly",
+                None,
+            )
         status_uri = self._status_uri(job, ctx)
         folder = self._dir("push") / slug
         shutil.rmtree(folder, ignore_errors=True)
@@ -546,8 +604,7 @@ class KaggleAdapter(Adapter):
             # the child at its timeout): only a daemon death leaves it behind (D35).
             _atomic_write(intent, json.dumps({"started_at": self.clock.now()}))
             res = self._run(
-                ["kernels", "push", "-p", str(folder), "-t", str(timeout_s)],
-                timeout=T_PUSH_AFTER_SECRETS if uploaded else T_PUSH,
+                ["kernels", "push", "-p", str(folder), "-t", str(timeout_s)], timeout=push_s
             )
         finally:
             with contextlib.suppress(OSError):
@@ -580,6 +637,361 @@ class KaggleAdapter(Adapter):
         """Where this attempt's runner pushes heartbeat/log-tail (phase 5), if anywhere."""
         root = str(ctx.env.get("GPU_STORAGE") or "").rstrip("/")
         return f"{root}/jobs/{job.id}/attempts/{ctx.n}" if root else None
+
+    # ------------------------------------------------------------------ blob datasets
+
+    def _left(self, deadline: float) -> float:
+        return deadline - self.clock.monotonic()
+
+    def _data_refs(self, ctx: AttemptContext) -> list[str]:
+        """Blob datasets the runner's GPU_DATA names (staged by stage_data), to attach."""
+        raw = ctx.env.get("GPU_DATA")
+        if not raw:
+            return []
+        try:
+            items = json.loads(raw)
+        except ValueError:
+            return []
+        refs: list[str] = []
+        for item in items if isinstance(items, list) else []:
+            uri = str(item.get("uri") or "") if isinstance(item, dict) else ""
+            if not uri.startswith(remote.DATA_URI_PREFIX):
+                continue
+            ref = uri[len(remote.DATA_URI_PREFIX) :].rpartition("/")[0]
+            if not _BLOB_REF.match(ref):
+                raise InvalidJob(f"dataset uri {uri!r} is not a gpu-router kaggle dataset")
+            refs.append(ref)
+        return refs
+
+    def _runner_source(
+        self,
+        owner: str,
+        key: str,
+        ctx: AttemptContext,
+        archive: Path,
+        secrets_ref: str | None,
+        deadline: float,
+    ) -> tuple[str, list[str], bool]:
+        """(run.py text, blob datasets to attach, uploaded one now). Bundle and resume
+        archive ride inline while run.py stays under remote.MAX_INLINE_SOURCE; else the
+        bigger one moves to a blob dataset first."""
+        bundle = archive.read_bytes()
+        bundle_sha = hashlib.sha256(bundle).hexdigest()
+        resume_path, resume_note = self._resume_source(ctx)
+        resume_sha = _file_sha256(resume_path) if resume_path is not None else None
+        seq_start = ctx.resume_from.seq + 1 if ctx.resume_from is not None else 1
+
+        def fits_inline(n: int) -> bool:
+            return n * 4 // 3 < remote.MAX_INLINE_SOURCE
+
+        bundle_in: tuple[str, str] | None = None
+        resume_in: tuple[str, str] | None = None
+        refs: list[str] = []
+        uploaded = False
+        move_bundle = not fits_inline(len(bundle))
+        move_resume = resume_path is not None and not fits_inline(resume_path.stat().st_size)
+        for _ in range(3):
+            if move_resume and resume_in is None and resume_path is not None:
+                assert resume_sha is not None
+                got = self._resume_blob(owner, resume_path, resume_sha, deadline)
+                if got is None:
+                    resume_path = resume_sha = None
+                    seq = ctx.resume_from.seq if ctx.resume_from else "?"
+                    resume_note = (
+                        f"checkpoint {seq} could not be uploaded to kaggle in time; starting fresh"
+                        if self._blobs
+                        else f"checkpoint {seq} is too big to ride inside a kaggle kernel and "
+                        "providers.kaggle.blob_datasets is off; starting fresh"
+                    )
+                else:
+                    ref, name, up = got
+                    resume_in, uploaded = (ref, name), uploaded or up
+                    refs.append(ref)
+            if move_bundle and bundle_in is None:
+                self._need_blobs("the job's bundle", len(bundle))
+                ref, name, up = self._ensure_blob(owner, "bundle", bundle_sha, archive, deadline)
+                bundle_in, uploaded = (ref, name), uploaded or up
+                refs.append(ref)
+            text = remote.render_runner(
+                attempt_key=key,
+                bundle=None if bundle_in else bundle,
+                bundle_input=bundle_in,
+                bundle_sha256=bundle_sha,
+                env=dict(ctx.env),
+                ckpt_seq_start=seq_start,
+                checkpoint_interval_min=ctx.checkpoint_interval_min,
+                resume=resume_path.read_bytes() if resume_path and not resume_in else None,
+                resume_sha256=resume_sha,
+                resume_input=resume_in,
+                resume_note=resume_note,
+                secrets_dataset=secrets_ref,
+            )
+            if len(text.encode()) <= remote.MAX_INLINE_SOURCE:
+                return text, refs, uploaded
+            if resume_path is not None and resume_in is None:
+                move_resume = True
+            elif bundle_in is None:
+                move_bundle = True
+            else:
+                break
+        raise InvalidJob(
+            f"kaggle's run.py would be over its {remote.MAX_INLINE_SOURCE // 1000} KB source "
+            "limit even with the bundle in a dataset (is the job's env very large?)",
+            provider=self.name,
+        )
+
+    def _retry_soon(self, message: str, hint: str | None) -> RateLimited:
+        """Blob trouble before the push: nothing was created, so it is definitive (no
+        ambiguous lookup) and only a short pause (BLOB_RETRY_S), not an outage cooldown;
+        the uploads made so far are reused on the next try."""
+        return RateLimited(message, provider=self.name, retry_after=BLOB_RETRY_S, hint=hint)
+
+    def _need_blobs(self, what: str, size: int) -> None:
+        if not self._blobs:
+            raise InvalidJob(
+                f"{what} ({size / 1e6:.1f} MB) is too big to ride inside the kernel (kaggle "
+                f"takes a source up to ~{remote.MAX_INLINE_SOURCE // 1000} KB) and "
+                "providers.kaggle.blob_datasets is off",
+                provider=self.name,
+                hint="turn providers.kaggle.blob_datasets back on",
+            )
+
+    def _resume_blob(
+        self, owner: str, path: Path, sha: str, deadline: float
+    ) -> tuple[str, str, bool] | None:
+        """The resume archive as a blob dataset; None when it timed out too often (the
+        attempt starts fresh rather than never starting)."""
+        if not self._blobs:
+            return None  # start fresh rather than exclude kaggle for the job
+        rec = self._blob_record(remote.blob_slug("ckpt", sha))
+        if int(rec.get("timeouts") or 0) >= BLOB_MAX_TIMEOUTS and not rec.get("ready"):
+            return None
+        return self._ensure_blob(owner, "ckpt", sha, path, deadline)
+
+    def stage_data(self, path: Path, sha256: str, files: Sequence[tuple[str, int]]) -> StagedData:
+        """A `data:` dataset as a private Kaggle dataset (no checkpoint storage needed),
+        once per content hash: later jobs with the same data attach the same dataset."""
+        self._need_blobs("a dataset", sum(size for _rel, size in files))
+        deadline = self.clock.monotonic() + T_STAGE_TOTAL
+        owner = self.username()
+        listed = list(files) if path.is_dir() else None
+        ref, name, uploaded = self._ensure_blob(owner, "data", sha256, path, deadline, listed)
+        return StagedData(
+            uri=remote.data_uri(ref, name), uploaded=uploaded, where=f"private kaggle dataset {ref}"
+        )
+
+    def _blob_lock(self, slug: str) -> threading.Lock:
+        with self._lock:
+            return self._blob_locks.setdefault(slug, threading.Lock())
+
+    def _blob_record(self, slug: str) -> dict[str, Any]:
+        try:
+            data = json.loads((self._dir("blobs") / f"{slug}.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_blob_record(self, slug: str, **fields: Any) -> None:
+        rec = self._blob_record(slug)
+        rec.update(fields)
+        _atomic_write(self._dir("blobs") / f"{slug}.json", json.dumps(rec, sort_keys=True))
+
+    def _blob_status(self, ref: str, deadline: float) -> str:
+        """`ready`, `missing` (404, or 403 = not visible to us, also right after a create)
+        or Kaggle's word for a dataset still being processed."""
+        res = self._run(
+            ["datasets", "status", ref], timeout=max(5.0, min(T_BLOB_STATUS, self._left(deadline)))
+        )
+        status = (res.stdout.strip().splitlines() or [""])[-1].strip().lower()
+        if res.ok and status:
+            return "missing" if status == "deleted" else status
+        low = res.output.lower()
+        if any(m in low for m in ("404", "not found", "403", "forbidden", "cannot access")):
+            return "missing"
+        raise classify(self.name, "datasets status", res)
+
+    def _ensure_blob(
+        self,
+        owner: str,
+        kind: str,
+        sha256: str,
+        source: Path,
+        deadline: float,
+        files: Sequence[tuple[str, int]] | None = None,
+    ) -> tuple[str, str, bool]:
+        """(`<owner>/<slug>`, file name, uploaded now) of the private dataset holding
+        `source` (a tar of `files` when given). Reused when Kaggle still has it ready."""
+        slug = remote.blob_slug(kind, sha256)
+        ref = f"{owner}/{slug}"
+        name = remote.blob_file(kind, sha256, tar=files is not None)
+        with self._blob_lock(slug):
+            rec = self._blob_record(slug)
+            status = self._blob_status(ref, deadline)
+            uploaded = False
+            recent = rec.get("ref") == ref and (
+                self.clock.now() - float(rec.get("uploaded_at") or 0) < BLOB_UPLOAD_GRACE_S
+            )
+            if status == "missing" and not recent:
+                self._upload_blob(ref, kind, sha256, name, source, files, deadline)
+                uploaded = True
+            if status != "ready":
+                self._wait_blob_ready(ref, deadline)
+            self._save_blob_record(
+                slug,
+                ref=ref,
+                kind=kind,
+                file=name,
+                ready=True,
+                last_used=self.clock.now(),
+                size=_source_size(source, files),
+            )
+        self._maybe_sweep_blobs()
+        return ref, name, uploaded
+
+    def _upload_blob(
+        self,
+        ref: str,
+        kind: str,
+        sha256: str,
+        name: str,
+        source: Path,
+        files: Sequence[tuple[str, int]] | None,
+        deadline: float,
+    ) -> None:
+        slug = ref.split("/")[-1]
+        folder = Path(tempfile.mkdtemp(prefix=f"up-{slug}-", dir=self._dir("blobs")))
+        try:
+            size = _source_size(source, files)
+            free = shutil.disk_usage(folder).free
+            if files is not None and free < size + 512 * 1024 * 1024:
+                raise InvalidJob(
+                    f"not enough free disk on this Mac to pack {source.name} for kaggle "
+                    f"({size / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free)",
+                    provider=self.name,
+                )
+            meta: dict[str, Any] = {
+                "title": remote.blob_title(kind, sha256),
+                "id": ref,
+                "licenses": [{"name": "unknown"}],
+            }
+            _atomic_write(folder / "dataset-metadata.json", json.dumps(meta) + "\n")
+            target = folder / name
+            try:
+                if files is not None:
+                    with tarfile.open(
+                        target, "w", format=tarfile.PAX_FORMAT, dereference=True
+                    ) as tar:
+                        for rel, _size in sorted(files):
+                            tar.add(str(source / rel), arcname=rel, recursive=False)
+                else:
+                    try:
+                        os.link(source, target)
+                    except OSError:
+                        shutil.copyfile(source, target)
+            except OSError as exc:  # A3: a file vanished, the disk filled up
+                raise Unavailable(
+                    f"could not pack {source.name} for kaggle ({exc.strerror or exc})",
+                    provider=self.name,
+                ) from None
+            budget = self._left(deadline) - 2 * T_BLOB_STATUS
+            if budget < 10:
+                raise Unavailable(
+                    f"no time left to upload {ref} to kaggle; gpu-router tries again shortly",
+                    provider=self.name,
+                )
+            self._save_blob_record(slug, ref=ref, kind=kind, uploading_at=self.clock.now())
+            try:
+                res = self._run(
+                    ["datasets", "create", "-p", str(folder), "-q", "-r", "skip"], timeout=budget
+                )
+            except Unavailable:
+                # timed out: the CLI was killed before its final create call; counted so a
+                # resume archive too big for this link stops blocking the attempt
+                rec = self._blob_record(slug)
+                self._save_blob_record(slug, timeouts=int(rec.get("timeouts") or 0) + 1)
+                raise
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+        low = res.output.lower()
+        if "being created" in low or "already" in low:
+            self._save_blob_record(slug, uploaded_at=self.clock.now())
+            return
+        err = classify(self.name, "datasets create", res)
+        if isinstance(err, (AuthRequired, RateLimited)):
+            raise err
+        raise Unavailable(
+            f"kaggle did not take the dataset {ref} ({size / 1e6:.1f} MB): "
+            f"{snippet(res.output) or 'no answer'}",
+            provider=self.name,
+        )
+
+    def _wait_blob_ready(self, ref: str, deadline: float) -> None:
+        while True:
+            status = self._blob_status(ref, deadline)
+            if status == "ready":
+                return
+            if status in ("failed", "error"):
+                raise Unavailable(
+                    f"kaggle could not process the dataset {ref} ({status})", provider=self.name
+                )
+            if self._left(deadline) < BLOB_READY_PAUSE_S + T_BLOB_STATUS:
+                raise Unavailable(
+                    f"kaggle is still processing the dataset {ref} ({status}); gpu-router "
+                    "tries again shortly and reuses the upload",
+                    provider=self.name,
+                )
+            self._sleep(BLOB_READY_PAUSE_S)
+
+    def _maybe_sweep_blobs(self) -> None:
+        """At most every BLOB_SWEEP_EVERY_S, a background thread deletes blob datasets
+        unused past their keep time (bundles/checkpoints 3 days, data data_keep_days)."""
+        if not BLOB_SWEEP or self._offline:
+            return
+        now = self.clock.now()
+        with self._lock:
+            if self._sweep_thread is not None and self._sweep_thread.is_alive():
+                return
+            if now - self._last_sweep < BLOB_SWEEP_EVERY_S:
+                return
+            self._last_sweep = now
+            self._sweep_thread = threading.Thread(
+                target=self.sweep_blobs, name=f"{self.name}-blob-sweep", daemon=True
+            )
+            self._sweep_thread.start()
+
+    def sweep_blobs(self) -> list[str]:
+        """Delete stale blob datasets (bounded); returns the refs deleted."""
+        deleted: list[str] = []
+        now = self.clock.now()
+        try:
+            records = sorted(self._dir("blobs").glob("gpu-router-*.json"))
+        except OSError:
+            return deleted
+        for path in records:
+            if len(deleted) >= BLOB_SWEEP_MAX:
+                break
+            slug = path.stem
+            # under the blob's lock, re-read: a submit that just ensured it (and is about
+            # to push a kernel reading it) refreshed last_used, so it is not stale any more
+            with self._blob_lock(slug):
+                rec = self._blob_record(slug)
+                ref, kind = str(rec.get("ref") or ""), str(rec.get("kind") or "")
+                used = max(
+                    float(rec.get(k) or 0) for k in ("last_used", "uploaded_at", "uploading_at")
+                )
+                keep = self._blob_keep_s.get(kind, 3 * 86400)
+                if not _BLOB_REF.match(ref) or now - used < keep:
+                    continue
+                try:
+                    res = self._run(["datasets", "delete", ref, "-y"], timeout=T_DELETE)
+                except AdapterError:
+                    break
+                low = res.output.lower()
+                if res.ok or "404" in low or "not found" in low:
+                    with contextlib.suppress(OSError):
+                        path.unlink()
+                    deleted.append(ref)
+        return deleted
 
     def _secrets_salt(self) -> bytes:
         path = self._dir("secrets") / "salt"
@@ -718,6 +1130,14 @@ class KaggleAdapter(Adapter):
         if not res.ok and "403 client error" in low:
             return AuthRequired(
                 "kaggle refused the push (403 forbidden)", provider=self.name, hint=PHONE_HINT
+            )
+        if not res.ok and "400 client error" in low:
+            # the server validated the request and refused it: nothing was saved. Seen live
+            # for a run.py over ~1 MB (2026-10-04), which submit no longer sends.
+            return InvalidJob(
+                f"kaggle refused the kernel (400 Bad Request): {snippet(res.output)}",
+                provider=self.name,
+                hint="the job runs elsewhere; `gpu doctor` checks the kaggle CLI",
             )
         err = classify(self.name, "kernels push", res)
         if isinstance(err, (AuthRequired, RateLimited)):

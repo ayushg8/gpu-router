@@ -594,7 +594,15 @@ def _classified(exc: BaseException, *, stage: str | None = None) -> DriverError:
     if "authentication failed" in low:
         # the SDK turns a 401 into ConnectionError("Authentication failed. Please run
         # `lightning login`.") (lightning_cloud/rest_client.request_auth_warning_wrapper)
-        err = DriverError("auth", f"lightning rejected the credentials: {text}", status=401)
+        # ... but gpu-router keeps its own copy of the key: `lightning login` alone never
+        # fixes it (a 2026-10-04 session told the user to run it), `gpu login lightning` does
+        why = text.replace("Please run `lightning login`.", "").strip() or text
+        err = DriverError(
+            "auth",
+            f"lightning rejected the stored API key ({why}); sign in again with "
+            "`gpu login lightning`",
+            status=401,
+        )
     elif status in (401,):
         err = DriverError("auth", f"lightning rejected the credentials: {text}", status=status)
     elif status == 403 or isinstance(exc, PermissionError):

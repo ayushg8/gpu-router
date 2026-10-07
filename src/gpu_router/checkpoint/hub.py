@@ -231,6 +231,7 @@ class CheckpointHub:
         self._hf_hint: str | None = None
         self._hf_retry_at = 0.0
         self._hf_transient = False  # the last failure should pass (network, 5xx, a locked Keychain)
+        self._remote_missing_at: float | None = None  # no HF_TOKEN_REMOTE seen at this time
         self._hf_fp: str | None = None
         self._hf_checked_at = 0.0
         self._extra_roots: dict[str, Storage] = {}
@@ -449,6 +450,27 @@ class CheckpointHub:
     def is_local_kind(self, kind: str) -> bool:
         return kind in self.local_kinds
 
+    def remote_data_possible(self) -> bool:
+        """Cached, no network (the routing path): can `data:` reach a remote runner through
+        HF storage? True when the bucket is connected or not tried yet; False when config
+        turned HF off or the last try was refused (no token, no access). A failure that
+        should pass (network, 5xx, a locked Keychain) counts as possible: the placement then
+        waits for storage (D44) instead of the router ruling every provider out."""
+        if self._hf_allowed() is not None:
+            return False
+        if self.hf_down_for_now():
+            return True
+        now = self.clock.now()
+        with self._lock:
+            missing = self._remote_missing_at
+            if missing is not None and now - missing < RETRY_PERMANENT_S:
+                return False  # bucket fine, but no HF_TOKEN_REMOTE for remote runners
+            if self._hf is not None or self._hf_reason is None:
+                return True
+            # refused: until the pause after it ends (then a new `gpu login hf` counts,
+            # since only placements call hf() and a refusal must not stick for good)
+            return now >= self._hf_retry_at
+
     def backend_for(self, kind: str) -> Storage | None:
         """Where runners of this adapter kind keep checkpoints (blocking for hf)."""
         if not self.enabled:
@@ -515,6 +537,10 @@ class CheckpointHub:
         out = AttemptStorage(kind=store.kind, root_uri=store.root_uri)
         if store.kind == "hf":
             token, problem = tokens.safe_remote_token()
+            with self._lock:
+                self._remote_missing_at = (
+                    self.clock.now() if token is None and problem is None else None
+                )
             if token is None:
                 if problem is not None and not degrade:
                     raise StorageError(f"cannot read the storage token ({problem})")

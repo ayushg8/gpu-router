@@ -136,6 +136,9 @@ class Reason(StrEnum):
     STORAGE_UNAVAILABLE = "storage_unavailable"  # this attempt's checkpoints cannot move
     DATA_UPLOADED = "data_uploaded"  # a dataset was uploaded to storage (once per content)
     DATA_REUSED = "data_reused"  # a dataset upload was found in the data cache
+    # a dataset is being uploaded to the provider's own store (Kaggle datasets, no
+    # checkpoint storage needed; 2026-10-04): the job stays provisioning until it is there
+    DATA_UPLOADING = "data_uploading"
     # the runner's nvidia-smi saw another GPU than the attempt was placed on (D56; note)
     GPU_MISMATCH = "gpu_mismatch"
 

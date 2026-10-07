@@ -46,9 +46,23 @@ Code: `adapter.py` (KaggleAdapter), `cli.py` (bounded CLI calls + error mapping)
   default: pip needs it), `machine_shape` from the router's GPU (`T4` -> `NvidiaTeslaT4`,
   `P100` -> `NvidiaTeslaP100`), `docker_image_pinning_type: original`, no data sources.
 - **Code transport**: `kernels push` uploads only `code_file` [V], so run.py carries the job
-  bundle as base64 (sha256-checked on arrival). Default limit `max_embed_mb` = 10 MB of
-  bundle (setting `providers.kaggle.max_embed_mb`); larger bundles are InvalidJob (reroute).
-  The real server limit is [I]; a 3.3 KB run.py with a 1 KB bundle worked [L].
+  bundle as base64 (sha256-checked on arrival) while run.py stays under
+  `remote.MAX_INLINE_SOURCE` (900,000 B). **SaveKernel refuses a code file over ~1 MB** [L,
+  2026-10-04, CLI 2.2.4, CPU probe kernels: 933,761 B pushed, 1,141,256 B and 3,112,456 B got
+  `400 Client Error: Bad Request for url: .../KernelsApiService/SaveKernel`; a 12.9 MB one got
+  `Expecting value: line 1 column 1 (char 0)`]. The old 10 MB inline limit was [I] and wrong:
+  every project bundle over ~700 KB failed to push between 2026-09-25 and 2026-10-04.
+- **Blob datasets** (2026-10-04): a bundle / resume archive that does not fit inline, and
+  `data:` datasets when there is no HF storage (`stage_data`), travel as private datasets
+  `<user>/gpu-router-{bundle,ckpt,data}-<sha16>` holding one `*.bin` file (a directory is one
+  uncompressed tar), attached through `dataset_sources`, sha256-checked (bundle, resume) by
+  run.py. Uploaded once per content and reused by later attempts and jobs; records in
+  `<home>/providers/kaggle/blobs/`; a background sweep deletes bundle/ckpt blobs unused for 3
+  days and data blobs unused for `data_keep_days` (30). Live facts [L, 2026-10-04]: a 3 MB
+  `.bin` dataset was `ready` ~5 s after `datasets create` (the first `datasets status` right
+  after the create answers 403); it mounts at `/kaggle/input/datasets/<owner>/<slug>/<file>`
+  byte-identical (sha256 checked in a CPU kernel). Settings: `blob_datasets` (true; false =
+  bundles over ~700 KB are InvalidJob), `max_bundle_mb` (100), `data_keep_days` (30).
 - **run.py on the kernel** (stdlib, py3.8+): writes the bundle to /tmp/gpu-router, extracts
   `gpu_runner/bootstrap.py`, runs bootstrap with `GPU_OUTPUT_DIR=/kaggle/working/outputs`,
   `GPU_CHECKPOINT_DIR=/tmp/gpu-router/checkpoints`, `--checkpoint-sync-dir

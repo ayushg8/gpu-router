@@ -28,7 +28,14 @@ the given result once (outage injection).
 
 Datasets (phase 5, the secrets channel): `datasets status|create|version` keep private
 datasets in `datasets` (ref -> SimDataset); a new version reports `blobs_received` for
-`dataset_ready_after` status calls before `ready`.
+`dataset_ready_after` status calls before `ready`. A new dataset answers 403 to its first
+`dataset_hidden_after` status calls (seen live right after a create, 2026-10-04);
+`datasets delete` removes one.
+
+Like Kaggle's SaveKernel (probed live 2026-10-04: 933,761 B pushed, 1,141,256 B refused),
+a push whose code file is over SAVEKERNEL_MAX_SOURCE answers `400 Client Error: Bad
+Request`, and a push whose dataset_sources name a dataset that does not exist answers a
+push error.
 """
 
 from __future__ import annotations
@@ -55,6 +62,11 @@ CANNOT_ACCESS = (
     "cause is a wrong kernel slug."
 )
 _KEY_IN_RUNPY = re.compile(r"^ATTEMPT_KEY = '([^']+)'", re.M)
+SAVEKERNEL_MAX_SOURCE = 1_000_000
+SAVEKERNEL_400 = (
+    "400 Client Error: Bad Request for url: "
+    "https://api.kaggle.com/v1/kernels.KernelsApiService/SaveKernel\n"
+)
 
 
 @dataclass
@@ -80,6 +92,7 @@ class SimDataset:
     public: bool = False
     pending: int = 0  # status calls left before "ready"
     deleted_old: int = 0  # versions created with --delete-old-versions
+    hidden: int = 0  # status calls left that answer 403 (fresh create)
 
 
 @dataclass
@@ -105,6 +118,9 @@ class SimKaggle:
     quota_limit_s: float | None = None
     datasets: dict[str, SimDataset] = field(default_factory=dict)
     dataset_ready_after: int = 0
+    dataset_hidden_after: int = 0
+    dataset_creates: list[str] = field(default_factory=list)  # refs, one per create
+    dataset_deletes: list[str] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     # ------------------------------------------------------------------ test API
@@ -305,10 +321,24 @@ class SimKaggle:
                     "datasets.DatasetApiService/GetDatasetStatus\n",
                     1,
                 )
+            if ds.hidden > 0:
+                ds.hidden -= 1
+                return (
+                    "",
+                    "403 Client Error: Forbidden for url: https://api.kaggle.com/v1/"
+                    "datasets.DatasetApiService/GetDatasetStatus\n",
+                    1,
+                )
             if ds.pending > 0:
                 ds.pending -= 1
                 return "blobs_received\n", "", 0
             return "ready\n", "", 0
+        if sub == "delete":
+            ref = args[2]
+            if self.datasets.pop(ref, None) is None:
+                return "", "404 Client Error: Not Found\n", 1
+            self.dataset_deletes.append(ref)
+            return f'Dataset "{ref}" deleted successfully.\n', "", 0
         if sub not in ("create", "version"):
             return "", f"unknown datasets command {sub}\n", 2
         folder = Path(args[args.index("-p") + 1])
@@ -324,8 +354,13 @@ class SimKaggle:
             if ref in self.datasets:
                 return "Dataset creation error: The requested title is already in use\n", "", 0
             self.datasets[ref] = SimDataset(
-                ref, files, public="-u" in args, pending=self.dataset_ready_after
+                ref,
+                files,
+                public="-u" in args,
+                pending=self.dataset_ready_after,
+                hidden=self.dataset_hidden_after,
             )
+            self.dataset_creates.append(ref)
             kind = "public" if "-u" in args else "private"
             return f"Your {kind} Dataset is being created. Please check progress at {url}\n", "", 0
         ds = self.datasets.get(ref)
@@ -346,6 +381,11 @@ class SimKaggle:
         if title and len(title) < 5:
             return "", "Title must be at least five characters\n", 1
         run_py = (folder / str(meta.get("code_file", "run.py"))).read_text()
+        if len(run_py.encode()) > SAVEKERNEL_MAX_SOURCE:
+            return "", SAVEKERNEL_400, 1
+        for src in meta.get("dataset_sources") or []:
+            if src not in self.datasets:
+                return f"Kernel push error: Invalid dataset source {src}\n", "", 0
         owner, _, slug = str(meta["id"]).partition("/")
         m = _KEY_IN_RUNPY.search(run_py)
         key = m.group(1) if m else slug

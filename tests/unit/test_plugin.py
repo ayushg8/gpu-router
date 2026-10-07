@@ -154,3 +154,17 @@ def test_wrapper_ships_in_the_plugin_and_matches_the_package() -> None:
     assert os.access(wrapper, os.X_OK)
     assert wrapper.read_text(encoding="utf-8") == install.wrapper_source()
     assert wrapper.read_text(encoding="utf-8").startswith("#!/bin/bash\n")
+
+
+def test_skill_and_codex_section_say_what_ships_and_how_to_queue_locally() -> None:
+    """D60: both agent docs (kept in sync by hand) explain ignored files, `include` /
+    `data`, bundle.left_out and the local queue pin."""
+    _, skill = _frontmatter(PLUGIN / "skills" / "gpu-router" / "SKILL.md")
+    codex = (REPO / "docs" / "codex" / "AGENTS-section.md").read_text(encoding="utf-8")
+    for body in (skill, codex):
+        plain = body.replace("`", "")
+        assert "Git-ignored files do not ship" in plain
+        assert "bundle.left_out" in plain
+        assert 'include=["third_party/"]' in plain
+        assert 'provider="local"' in plain
+        assert "one job at a time" in plain

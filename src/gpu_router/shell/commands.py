@@ -335,6 +335,7 @@ def _spec_parser(name: str, *, with_run_flags: bool) -> _Parser:
         p.add_argument("--name")
         p.add_argument("--env", "-e", action="append")
         p.add_argument("--data", action="append")  # [NAME=]PATH | hf://datasets/...
+        p.add_argument("--include", action="append")  # ship even if git ignores it (D60)
         p.add_argument("--wait", "-w", action="store_true")
         p.add_argument("--detach", "-d", action="store_true")
         p.add_argument("--dry-run", action="store_true")
@@ -356,6 +357,7 @@ def _spec(ns: argparse.Namespace, script_args: list[str]) -> Any:
         project=Path(ns.project).expanduser() if ns.project else None,
         smoke=bool(ns.smoke),
         data=getattr(ns, "data", None),
+        include=getattr(ns, "include", None),
     )
     return spec.model_copy(update={"source": Source.SHELL})
 
