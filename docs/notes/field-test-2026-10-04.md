@@ -175,8 +175,8 @@ The stored note holds an expired link and stays (events are append-only).
   do.
 - Colab cannot take `data=` without HF storage (each attempt is a fresh VM; no per-provider
   store). The router now skips it for such jobs instead of failing there.
-- A fetch that fails on a transient network error is not retried automatically (the agent
-  or `gpu fetch <id>` retries; the note says so).
+- (Fixed 2026-10-06) A fetch that failed on a transient network error was not retried;
+  now it is retried twice (20 s, 60 s) before the job says "could not fetch".
 - Not verified live: a Kaggle resume archive over the inline limit, the blob sweep against
   the real API, a multi-GB `data=` upload (time depends on the uplink; the stage call allows
   an hour and waits/retries up to `checkpoint.storage_wait_s` after that).
