@@ -124,6 +124,7 @@ def test_plist_render_and_install_without_loading(
     assert data["KeepAlive"] == {"SuccessfulExit": False}
     assert data["RunAtLoad"] is True
     assert data["StandardOutPath"] == str(paths.launchd_log)
+    assert data["ProcessType"] == "Standard"  # Background starved it under load (2026-10-06)
     assert "EnvironmentVariables" not in data
     with_home = plistlib.loads(launchd.render_plist(executable=exe, paths=paths, env_home="/x/y"))
     assert with_home["EnvironmentVariables"] == {"GPU_ROUTER_HOME": "/x/y"}
@@ -149,3 +150,37 @@ def test_daemon_cli_usage_and_not_running(capsys: pytest.CaptureFixture[str]) ->
     assert daemon_main(["status", "--json"]) == EXIT_STATE
     assert '"running": false' in capsys.readouterr().out
     assert daemon_main(["stop"]) == EXIT_STATE
+
+
+def test_install_retries_a_bootstrap_while_the_old_daemon_exits(
+    paths: Paths, tmp_path: Path
+) -> None:
+    """2026-10-06: `launchctl bootstrap` right after the bootout answered 5 (Input/output
+    error) because the old, starved daemon had not exited yet; the agent was left
+    unloaded. install() retries that code with growing pauses."""
+    from types import SimpleNamespace
+
+    exe = tmp_path / "bin" / "gpu"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\n")
+    fake_home = tmp_path / "userhome"
+    launchd.install(paths, executable=exe, load=False, home=fake_home)  # an existing agent
+    answers = [5, 5, 0]
+    calls: list[tuple[str, ...]] = []
+    pauses: list[float] = []
+
+    def fake_launchctl(*args: str) -> SimpleNamespace:
+        calls.append(args)
+        code = answers.pop(0) if args[0] == "bootstrap" else 0
+        return SimpleNamespace(returncode=code, stdout="", stderr="Bootstrap failed: 5")
+
+    launchd.install(
+        paths, executable=exe, home=fake_home, launchctl=fake_launchctl, sleep=pauses.append
+    )
+    assert [c[0] for c in calls] == ["bootout", "bootstrap", "bootstrap", "bootstrap"]
+    assert pauses == [2.0, 4.0]
+    answers[:] = [5] * 10
+    with pytest.raises(RuntimeError, match="bootstrap failed \\(5\\)"):
+        launchd.install(
+            paths, executable=exe, home=fake_home, launchctl=fake_launchctl, sleep=pauses.append
+        )

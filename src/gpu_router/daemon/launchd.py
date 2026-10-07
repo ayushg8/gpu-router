@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import plistlib
 import subprocess
+import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,8 @@ from gpu_router.paths import ENV_HOME, Paths
 LABEL = "dev.gpu-router.daemon"
 LAUNCHCTL = "/bin/launchctl"
 _LAUNCHCTL_TIMEOUT_S = 30
+BOOTSTRAP_BUSY = 5  # launchctl bootstrap's code while the booted-out instance still exits
+BOOTSTRAP_RETRY_S = (2.0, 4.0, 8.0, 16.0)
 
 
 def plist_path(home: Path | None = None) -> Path:
@@ -42,7 +45,11 @@ def render_plist(*, executable: Path, paths: Paths, env_home: str | None) -> byt
         "ThrottleInterval": 30,
         "StandardOutPath": str(paths.launchd_log),
         "StandardErrorPath": str(paths.launchd_log),
-        "ProcessType": "Background",
+        # Standard, not Background (2026-10-06): background QoS let macOS starve the daemon
+        # and every provider CLI it starts whenever the Mac was busy (1 s of CPU in 14 min
+        # at load 150), which is exactly when agents send work to cloud GPUs. The daemon
+        # idles between polls, so normal priority costs the foreground nothing.
+        "ProcessType": "Standard",
     }
     if env_home:
         agent["EnvironmentVariables"] = {ENV_HOME: env_home}
@@ -75,6 +82,7 @@ def install(
     home: Path | None = None,
     launchctl: Callable[..., Any] | None = None,
     environ: Mapping[str, str] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Path:
     """Write the plist (atomic, 0644) and, if `load`, bootstrap it. Idempotent: an existing
     agent is booted out first. Returns the plist path. `launchctl(*args)` (returns an object
@@ -94,6 +102,13 @@ def install(
     os.replace(tmp, target)
     if load:
         proc = run("bootstrap", _domain(), str(target))
+        # right after a bootout, launchd answers 5 (Input/output error) until the old
+        # daemon has exited, which can take a while on a busy Mac (2026-10-06)
+        for pause in BOOTSTRAP_RETRY_S:
+            if proc.returncode != BOOTSTRAP_BUSY:
+                break
+            sleep(pause)
+            proc = run("bootstrap", _domain(), str(target))
         if proc.returncode != 0:
             raise RuntimeError(
                 f"launchctl bootstrap failed ({proc.returncode}): "
