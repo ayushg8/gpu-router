@@ -99,6 +99,12 @@ def _reject(p: ProviderSnapshot, ctx: RoutingContext) -> Rejection | None:
         return Rejection(
             provider=name, code=RejectCode.EXCLUDED, reason=f"{name}: rejected this job earlier"
         )
+    if name in ctx.data_unreachable:
+        return Rejection(
+            provider=name,
+            code=RejectCode.EXCLUDED,
+            reason=f"{name}: {ctx.data_unreachable[name]}",
+        )
     health = p.state.health
     if health is ProviderHealth.DISABLED:
         return Rejection(provider=name, code=RejectCode.DISABLED, reason=f"{name}: disabled")
@@ -183,6 +189,9 @@ def _no_fit_reason(ctx: RoutingContext, rejected: list[Rejection]) -> str:
             "`gpu providers` lists the excluded ones"
         )
     if all(r.code is RejectCode.EXCLUDED for r in core):
+        data = [r for r in core if r.provider in ctx.data_unreachable]
+        if data:  # say why: the earlier-rejection wording hid it (2026-10-04 field test)
+            return "no provider fits: " + "; ".join(r.reason for r in core[:3])
         names = ", ".join(r.provider for r in core)
         return f"no provider fits: every provider rejected this job ({names})"
     parts = [r.reason for r in meaningful[:3]]

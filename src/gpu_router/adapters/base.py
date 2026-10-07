@@ -26,7 +26,7 @@ A10 read time only from the injected clock (invariant 13).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -53,6 +53,7 @@ __all__ = [
     "RemotePhase",
     "RemoteRef",
     "RemoteStatus",
+    "StagedData",
 ]
 
 
@@ -144,6 +145,14 @@ class FetchResult(_Frozen):
     message: str | None = None
 
 
+class StagedData(_Frozen):
+    """stage_data() result: where a dataset now lives on the provider's side."""
+
+    uri: str  # what the runner gets in GPU_DATA (the adapter's own scheme)
+    uploaded: bool  # False: an earlier upload of the same content was reused
+    where: str  # for the job's note: "private kaggle dataset me/gpu-router-data-..."
+
+
 class Health(_Frozen):
     """healthcheck() result: ok, or the reason not."""
 
@@ -172,6 +181,9 @@ class Capabilities(_Frozen):
     max_concurrency: int = Field(default=1, ge=1)  # concurrent remote runs allowed
     max_bundle_mb: float | None = None
     poll_interval_s: float = Field(default=30, gt=0)  # recommended status() cadence
+    # stage_data() works: datasets reach this provider without checkpoint storage (the
+    # provider's own dataset store, e.g. Kaggle datasets; 2026-10-04)
+    stage_data: bool = False
 
 
 # --------------------------------------------------------------------------- the ABC
@@ -265,6 +277,16 @@ class Adapter(ABC):
         from gpu_router.errors import Permanent
 
         raise Permanent(f"{self.name} cannot look runs up by key", provider=self.name)
+
+    def stage_data(self, path: Path, sha256: str, files: Sequence[tuple[str, int]]) -> StagedData:
+        """Put a dataset (`path`: a file or a directory; `files` = (relative path, size) as
+        `checkpoint.data.digest` listed them, `sha256` its content hash) where this
+        provider's runs can read it, once per content: a second call with the same sha256
+        reuses the upload. Blocking, bounded below engine.timeouts.stage_data. Only called
+        when capabilities.stage_data; the default raises Permanent."""
+        from gpu_router.errors import Permanent
+
+        raise Permanent(f"{self.name} cannot stage datasets", provider=self.name)
 
     def close(self) -> None:  # noqa: B027 - optional hook, deliberately not abstract
         """Release resources on daemon shutdown. Must not touch remote runs (invariant 11)."""

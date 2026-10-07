@@ -238,6 +238,7 @@ def _build(
     project: Path | None,
     smoke: bool = False,
     data: list[str] | None = None,
+    include: list[str] | None = None,
 ) -> JobSpec:
     from gpu_router.jobspec import Flags, build_spec, find_project_root, parse_env_pairs
 
@@ -255,6 +256,7 @@ def _build(
         name=name,
         env=parse_env_pairs(env or []),
         smoke=True if smoke else None,
+        include=list(include or []),
     )
     spec, _doc, _root = build_spec(flags, cwd=cwd, project_root=root)
     if data:
@@ -324,6 +326,7 @@ RUN_VALUE_OPTS = frozenset(
         "--project",
         "-C",
         "--data",
+        "--include",
     }
 )
 RUN_FLAG_OPTS = frozenset(
@@ -516,6 +519,14 @@ def run(
             "cached by content, at $GPU_DATA_DIR/NAME on the GPU.",
         ),
     ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--include",
+            help="Ship this path or glob (relative to the project root) even if git "
+            "ignores it, e.g. third_party/ (repeatable; added to gpu.yaml include:).",
+        ),
+    ] = None,
     wait: Annotated[
         bool | None,
         typer.Option(
@@ -571,6 +582,7 @@ def run(
             project=project,
             smoke=smoke,
             data=data,
+            include=include,
         )
         spec = _agent_spec(spec, out, as_agent=as_agent)
         import os
@@ -787,6 +799,14 @@ def route(
     smoke: Annotated[
         bool, typer.Option("--smoke", help="Quick smoke test: prefer this Mac (MPS).")
     ] = False,
+    data: Annotated[
+        list[str] | None,
+        typer.Option("--data", help="Dataset [NAME=]PATH or hf://datasets/... (as `gpu run`)."),
+    ] = None,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Ship this ignored path or glob too (as `gpu run`)."),
+    ] = None,
     project: Annotated[
         Path | None, typer.Option("--project", "-C", help="As if started in this directory.")
     ] = None,
@@ -806,6 +826,8 @@ def route(
             env=None,
             project=project,
             smoke=smoke,
+            data=data,
+            include=include,
         )
         client = connect(out)
         _check_provider(client, spec)

@@ -19,6 +19,8 @@ Rules (spec "Agent integration and docs", invariant 2):
   from an agent that may have read untrusted job logs.
 - Log text is the job's own output: bounded (tail, per-line and total caps) and labelled
   as untrusted data.
+- gpu_submit and gpu_route carry a `bundle` summary (D60): files and bytes that ship, the
+  git-ignored paths that do not (`left_out`) and how to ship them (`include` / `data`).
 """
 
 from __future__ import annotations
@@ -202,6 +204,27 @@ def _script(raw: str | None) -> str | None:
     return text
 
 
+def _include(include: Sequence[str] | None) -> list[str]:
+    out: list[str] = []
+    for item in include or []:
+        if not isinstance(item, str):
+            raise InvalidRequest("include is a list of paths or globs (strings)")
+        out.append(item)
+    return out
+
+
+def bundle_view(spec: JobSpec) -> dict[str, Any]:
+    """The bundle summary for an agent (packaging.bundle_summary): files and bytes that
+    ship, what git ignores and so does not, and how to ship it. Never raises: a summary
+    must not fail the submit it describes."""
+    from gpu_router.packaging.bundle import bundle_summary
+
+    try:
+        return bundle_summary(spec)
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": f"could not summarize the bundle: {type(exc).__name__}"}
+
+
 def _env_pairs(env: Mapping[str, str] | None) -> list[str]:
     pairs: list[str] = []
     for key, value in (env or {}).items():
@@ -224,9 +247,11 @@ def build_spec(
     env: Mapping[str, str] | None = None,
     data: Sequence[str] | None = None,
     smoke: bool = False,
+    include: Sequence[str] | None = None,
 ) -> JobSpec:
-    """gpu.yaml in the project + these values (they win), like `gpu run -C <project_dir>`,
-    marked `source=agent`. Raises InvalidRequest / InvalidSpec / GpuYamlError."""
+    """gpu.yaml in the project + these values (they win; `include` adds to gpu.yaml's),
+    like `gpu run -C <project_dir>`, marked `source=agent`. Raises InvalidRequest /
+    InvalidSpec / GpuYamlError."""
     from gpu_router.cli.app import _build
 
     root = _project_dir(project_dir)
@@ -242,6 +267,7 @@ def build_spec(
         project=root,
         smoke=smoke,
         data=[str(d) for d in (data or [])] or None,
+        include=_include(include),
     )
     # the agent intake rules (agent.py, D45/D48): no credential store, no home directory,
     # no dataset linking into a store; the git root may sit above project_dir
@@ -268,9 +294,20 @@ def _metrics_view(metrics: Mapping[str, float]) -> tuple[dict[str, float], int]:
     return {k: metrics[k] for k in shown}, len(names) - len(shown)
 
 
-def _job_doc(job: Job, *, verbose: bool) -> dict[str, Any]:
-    """The JobView document; trimmed metrics unless verbose."""
+#: spec fields an agent polling a job still wants (it saw the full spec at submit)
+SPEC_BRIEF = ("script", "command", "args", "hours", "provider", "gpu", "vram_gb")
+
+
+def _job_doc(job: Job, *, verbose: bool, full_spec: bool = True) -> dict[str, Any]:
+    """The JobView document; trimmed metrics unless verbose. `full_spec=False` (polling:
+    gpu_status, gpu_fetch) keeps only SPEC_BRIEF and drops the hashes: ~25% of every poll
+    in the 2026-10-04 field test was the same spec again."""
     doc: dict[str, Any] = _dump(job, verbose=verbose)
+    if not verbose and not full_spec:
+        spec = doc.get("spec") or {}
+        doc["spec"] = {k: spec[k] for k in SPEC_BRIEF if spec.get(k) not in (None, [], {})}
+        doc.pop("spec_hash", None)
+        doc.pop("bundle_sha256", None)
     if not verbose and job.last_metrics:
         shown, hidden = _metrics_view(job.last_metrics)
         doc["last_metrics"] = shown
@@ -345,6 +382,9 @@ def guidance(job: Job) -> dict[str, Any]:
         hours = job.spec.hours
         if hours is not None and hours <= FOLLOW_MAX_HOURS:
             g["follow"] = "wait"
+            # the long poll already waits: never hint a gap the wait_s cap cannot cover
+            # (field test 2026-10-04: poll_every_s 60 next to a 50 s cap read as a conflict)
+            g["poll_every_s"] = min(every, int(MAX_WAIT_S))
             g["next"] = (
                 f"a short job: follow it with gpu_status(ref='{sid}', "
                 f"wait_s={min(every, int(MAX_WAIT_S))}) until guidance.finished is true; "
@@ -540,6 +580,7 @@ def submit(
     env: Mapping[str, str] | None = None,
     data: Sequence[str] | None = None,
     smoke: bool = False,
+    include: Sequence[str] | None = None,
     request_id: str | None = None,
     wait_s: float = 10.0,
     verbose: bool = False,
@@ -570,6 +611,7 @@ def submit(
         env=env,
         data=data,
         smoke=smoke,
+        include=include,
     )
     with connector() as client:
         _check_provider(client, spec)
@@ -589,6 +631,8 @@ def submit(
             _note(f"job {job.short_id} was submitted; could not read it back: {exc.message}")
         result = job_result(job, verbose=verbose)
         result["submitted"] = created
+        if created:  # what this submit just packaged (and what it left out)
+            result["bundle"] = bundle_view(spec)
         if not created:
             age = max(0.0, _wall() - job.created_at)
             result["duplicate_of"] = job.short_id
@@ -683,7 +727,7 @@ def status(
         else:
             n = max(0, min(int(events), 50))
             out = {
-                "job": _job_doc(detail.job, verbose=False),
+                "job": _job_doc(detail.job, verbose=False, full_spec=False),
                 "attempts": [_dump(a, verbose=False) for a in detail.attempts[-3:]],
                 "checkpoints": [_dump(c, verbose=False) for c in detail.checkpoints[-3:]],
                 "events": [_dump(e, verbose=False) for e in detail.events[-n:]] if n else [],
@@ -901,7 +945,7 @@ def fetch(
         detail = client.job(job_ref)
         job = detail.job
         payload: dict[str, Any] = {
-            "job": _job_doc(job, verbose=verbose),
+            "job": _job_doc(job, verbose=verbose, full_spec=False),
             "dest": None,
             "untrusted": UNTRUSTED_FIELDS,
         }
@@ -957,7 +1001,7 @@ def fetch(
             message = str(result["message"])
         fetched_listing = _outputs(job.outputs_dir) if ok else None
         payload.update(
-            job=_job_doc(job, verbose=verbose),
+            job=_job_doc(job, verbose=verbose, full_spec=False),
             fetched=ok,
             outputs_dir=job.outputs_dir,
             files=int(result.get("files", 0)) if result else 0,
@@ -1069,10 +1113,12 @@ def route(
     provider: str | None = None,
     data: Sequence[str] | None = None,
     smoke: bool = False,
+    include: Sequence[str] | None = None,
     verbose: bool = False,
     connector: Callable[[], GpuClient] = connect,
 ) -> dict[str, Any]:
-    """gpu_route: dry run. Where the job would go, why, and whether it would ask."""
+    """gpu_route: dry run. Where the job would go, why, whether it would ask, and what
+    would ship (`bundle`)."""
     from gpu_router.cli.app import _check_provider
 
     spec = build_spec(
@@ -1085,6 +1131,7 @@ def route(
         provider=provider,
         data=data,
         smoke=smoke,
+        include=include,
     )
     with connector() as client:
         _check_provider(client, spec)
@@ -1097,6 +1144,7 @@ def route(
             "spec": _dump(spec, verbose=verbose),
             "route": _dump(decision, verbose=verbose),
             "approval": approval,
+            "bundle": bundle_view(spec),
         }
         if decision.outcome is RouteOutcome.PLACE and decision.chosen is not None:
             chosen = decision.chosen

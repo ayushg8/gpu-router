@@ -57,7 +57,8 @@ Flags: `--vram GB`, `--hours H`, `--provider/-p NAME`, `--gpu TYPE`, `--name NAM
 `--env/-e NAME=VALUE` (repeatable), `--wait/-w` or `--detach/-d`, `--dry-run`,
 `--smoke` (phase 5: a quick smoke test, routed to the local Mac first; also on `gpu route`),
 `--data [NAME=]PATH|hf://datasets/...` (phase 5, repeatable; merged into gpu.yaml `data:` by
-mount, the flag wins), `--project/-C DIR`, `--as-agent`, `--json`.
+mount, the flag wins), `--include PATH|GLOB` (D60, repeatable, before the script only; added
+to gpu.yaml `include:`), `--project/-C DIR`, `--as-agent`, `--json`.
 
 `--as-agent` (D48) submits the job as an AI agent's (`source: agent`): the agent approval
 rules apply and datasets / project roots in or around credential stores are refused, as
@@ -86,7 +87,10 @@ job was placed on, the timeline gets a `gpu_mismatch` note, `gpu status <job>` s
 - Ctrl-C while waiting detaches: the job keeps running (exit 130); with `--json` stdout gets
   `{"job": JobView, "detached": true}`.
 - `--dry-run` routes the spec and previews the bundle (files, size, deps, VRAM/runtime
-  estimate, warnings) without submitting.
+  estimate, warnings) without submitting, plus (D60) a `left out:` line naming the
+  git-ignored paths that do not ship (`data/ (2.1 GB, ignored)`, `third_party/ (6 KB,
+  nested git repo)`, at most 8, grouped by top-level dir beyond that; venvs, caches, `runs/`
+  and credential-looking paths are never named) and the hint to use `include:` or `--data`.
 - An unknown `--provider` (or gpu.yaml `provider:`) is exit 4 with a did-you-mean hint;
   nothing is submitted.
 - `--data` (phase 5): a dataset appears on the GPU at `$GPU_DATA_DIR/<NAME>`
@@ -97,7 +101,17 @@ job was placed on, the timeline gets a `gpu_mismatch` note, `gpu status <job>` s
   `gpu login hf`; without it a job with data is kept off remote providers (note
   `provider_excluded`). A path that does not exist is exit 2 before anything is submitted.
 - The daemon packages the project at submit: git-tracked files plus untracked files git
-  does not ignore (named in a bundle warning), never credential-looking files. The submit
+  does not ignore (named in a bundle warning), plus whatever `include:` / `--include`
+  matches (D60), never credential-looking files. `include` entries are paths or globs
+  relative to the project root (`third_party/`, `data/crops/*.png`, `experiments/**/out`;
+  `*` stays within one directory, `**` spans any number, a trailing `/` matches directories
+  only, a matching directory ships whole, nested git repos included); absolute, `~` and
+  `..` entries are refused, an entry that matches nothing or goes through a symlink is a
+  warning. Inside included trees VCS dirs (`.git`, ...), virtualenvs (`.venv`, `venv`, any dir
+  with a `pyvenv.cfg`), `node_modules`, tool caches and `*.pyc` are skipped (an entry naming
+  `.git/...` never ships), and the
+  credential, outside-symlink and 200 MB rules apply as everywhere; one walk visits at
+  most 50,000 files (pass datasets with `--data`). The submit
   request waits up to 300 s for that; if no answer comes back the error is
   `submit_uncertain` (exit 1) with the idempotency key: check `gpu jobs` before retrying.
 
@@ -108,7 +122,8 @@ working directory. `gpu.yaml` is read from the project root. Scripts given on th
 line are resolved against the current directory and stored relative to the project root.
 
 Merge (spec decision 2): start from gpu.yaml, then every flag the user passed wins.
-`--env` merges per key over the file's `env`; script arguments on the command line replace
+`--env` merges per key over the file's `env`; `--include` adds to the file's `include`;
+script arguments on the command line replace
 the file's `args`; a script/command on the command line replaces the file's entrypoint and
 drops the file's `name` (unless it is the same entrypoint, or `--name` is given).
 `provider:` is lowercased like `--provider`. gpu.yaml's `script:` must exist whenever it is
@@ -134,6 +149,7 @@ deps: auto                    # auto | none | requirements.txt | pyproject.toml 
 data:                         # mounted under $GPU_DATA_DIR/<mount>
   - {mount: coco, path: data/coco}
   - {mount: wiki, uri: "hf://datasets/me/wiki"}
+include: [third_party/, "data/crops/*.png"]  # ship even if git ignores it (string or list, D60)
 checkpoint_interval_min: 20   # 0 disables checkpoint sync
 interactive: false
 requires_approval: false      # always ask before running
@@ -183,7 +199,7 @@ Model shapes (`JobView`, `JobDetail`, `StatusView`, `RouteDecision`, `ProviderVi
 |---|---|
 | `run` (detach) | `{"job": JobView}` |
 | `run --wait` | `{"job": JobView}` (final state); Ctrl-C: `{"job": JobView, "detached": true}` |
-| `run --dry-run` | `{"dry_run": true, "spec": JobSpec, "route": RouteDecision, "bundle": Bundle or null}` |
+| `run --dry-run` | `{"dry_run": true, "spec": JobSpec, "route": RouteDecision, "bundle": Bundle or null}`; Bundle = `{sha256, file_count, size_bytes, code_bytes, cached, deps, estimate, warnings}` + (D60) `included: {files, bytes}` when the spec has `include`, and `left_out: [str]`, `left_out_not_shown`, `hint` when ignored paths do not ship |
 | `route` | `{"spec": JobSpec, "route": RouteDecision}` |
 | `status` | `StatusView` `{ready, counts, active, recent, providers}` |
 | `status ID` | `JobDetail` `{job, attempts, checkpoints, events, route}` |

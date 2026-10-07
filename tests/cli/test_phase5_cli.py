@@ -94,3 +94,17 @@ def test_quota_refresh_and_note(cli: Cli) -> None:
     human = cli("quota")
     assert "how" in human.stdout
     assert "live from fake" in human.stdout
+
+
+def test_route_takes_data_and_include_like_run(cli: Cli) -> None:
+    """2026-10-04 field test: `gpu route` had no --data / --include, so the dry run could
+    not show how a job with a dataset would be routed."""
+    (cli.project / "rows").mkdir()
+    (cli.project / "rows" / "a.csv").write_text("a\n")
+    data, res = cli.json("route", "--data", "rows=rows", "--include", "extra/", "train.py")
+    # the test daemon's fakes are remote and there is no HF storage: the data reaches none
+    assert res.exit_code == exitcodes.NO_FIT
+    assert "cannot receive data= without Hugging Face storage" in data["route"]["reason"]
+    (ref,) = data["spec"]["data"]
+    assert (ref["mount"], ref["path"]) == ("rows", str((cli.project / "rows").resolve()))
+    assert data["spec"]["include"] == ["extra/"]

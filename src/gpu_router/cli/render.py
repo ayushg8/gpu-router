@@ -15,7 +15,7 @@ import os
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
-from rich.console import Console
+from rich.console import Console, Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 
@@ -290,10 +290,13 @@ def providers_footer(providers: Iterable[ProviderView], now: float, running: int
     return out
 
 
-def providers_table(providers: Sequence[ProviderView], now: float) -> Table:
+def providers_table(providers: Sequence[ProviderView], now: float) -> RenderableType:
+    """The table, then one `name: note` line per provider with a note. Notes used to be a
+    7th column, which an 80-column pipe (agents, CI) squeezed to 4 characters a line."""
     t = Table(box=None, pad_edge=False, show_edge=False, header_style="dim")
-    for col in ("provider", "status", "gpus", "session", "running", "quota", "note"):
-        t.add_column(col, no_wrap=col not in ("gpus", "note"), overflow="fold")
+    for col in ("provider", "status", "gpus", "session", "running", "quota"):
+        t.add_column(col, no_wrap=True)
+    notes: list[Text] = []
     for p in providers:
         t.add_row(
             p.name if p.enabled else Text(p.name, style="dim"),
@@ -302,9 +305,27 @@ def providers_table(providers: Sequence[ProviderView], now: float) -> Table:
             f"{fmt_num(p.session_hours)}h" if p.session_hours else "-",
             str(p.live_attempts),
             quota_text(p.quota, now) if p.quota else "-",
-            Text(p.health_reason or "", style="dim"),
         )
-    return t
+        if p.health_reason:
+            notes.append(Text.assemble(f"{p.name}: ", (p.health_reason, "dim")))
+        st = p.state
+        if st is not None and st.cooldown_until is not None and st.cooldown_until > now:
+            # "up" alone hid that every submit was failing (2026-10-04, kaggle)
+            fails = st.consecutive_failures
+            after = (
+                f" after {fails} failed call{'s' if fails != 1 else ''} in a row" if fails else ""
+            )
+            notes.append(
+                Text.assemble(
+                    f"{p.name}: ",
+                    (
+                        f"cooling down for {duration(st.cooldown_until - now)}{after}; "
+                        "new jobs go elsewhere meanwhile (`gpu history --failed` shows why)",
+                        "dim",
+                    ),
+                )
+            )
+    return Group(t, Text(""), *notes) if notes else t
 
 
 def quota_table(
@@ -568,6 +589,14 @@ def print_bundle(console: Console, bundle: dict[str, object]) -> None:
     if isinstance(warnings, list):
         for w in warnings:
             console.print(Text(f"  ! {w}", style="yellow"))
+    left = bundle.get("left_out")
+    if isinstance(left, list) and left:  # D60: what git-ignores and so never ships
+        more = bundle.get("left_out_not_shown")
+        tail = f" (+{more} more)" if isinstance(more, int) and more else ""
+        console.print(Text(f"  left out: {', '.join(str(x) for x in left)}{tail}"))
+        hint = bundle.get("hint")
+        if isinstance(hint, str):
+            console.print(Text(f"  {hint}", style="dim"))
 
 
 def route_facts(decision: RouteDecision) -> str:

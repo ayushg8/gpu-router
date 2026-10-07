@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from gpu_router.router.base import JobEstimate, ProviderSnapshot, RoutingContext
@@ -68,11 +69,31 @@ def build_routing_context(
         now=deps.clock.now(),
         providers=providers,
         excluded=excluded,
+        data_unreachable=data_unreachable(deps, job, providers),
         previous_provider=previous,
         resuming=resuming,
         estimate=estimate,
         resume_step=resume_step,
     )
+
+
+def data_unreachable(
+    deps: EngineDeps, job: Job, providers: Sequence[ProviderSnapshot]
+) -> dict[str, str]:
+    """Providers this job's local `data:` paths cannot reach, with why: no HF storage for
+    remote runs (cached hub state, no network) and no adapter.stage_data. Runs on this Mac
+    link the path; URIs (hf://) need nothing. Empty when unknown (HF not tried yet)."""
+    hub = deps.checkpoints
+    if hub is None or not any(d.path for d in job.spec.data) or hub.remote_data_possible():
+        return {}
+    can = [p.name for p in providers if p.capabilities.stage_data]
+    alt = f" ({', '.join(can)} can: it keeps datasets itself)" if can else ""
+    out: dict[str, str] = {}
+    for p in providers:
+        if hub.is_local_kind(p.entry.kind) or p.capabilities.stage_data:
+            continue
+        out[p.name] = f"cannot receive data= without Hugging Face storage{alt}"
+    return out
 
 
 def quota_views(deps: EngineDeps) -> dict[str, QuotaSnapshot]:

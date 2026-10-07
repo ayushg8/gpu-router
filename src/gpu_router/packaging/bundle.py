@@ -3,7 +3,8 @@
 Archive layout (what bootstrap.py expects once extracted):
 
     manifest.json        entrypoint, deps, estimate, file stats, warnings (see build_manifest)
-    code/<rel path>      git-tracked + untracked-not-ignored project files (files.py)
+    code/<rel path>      git-tracked + untracked-not-ignored project files, plus what the
+                         spec's `include:` matches (files.py, D60)
     gpu_runner/gpu.py    the `import gpu` helper (on PYTHONPATH remotely)
     gpu_runner/bootstrap.py
     gpu_runner/storage.py  checkpoint/data/status storage (phase 5; used by bootstrap.py)
@@ -30,7 +31,7 @@ import os
 import shutil
 import tarfile
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,7 +39,16 @@ from typing import TYPE_CHECKING, Any
 from gpu_router.errors import InvalidSpec
 from gpu_router.packaging.deps import DepsError, DepsInfo, detect_deps
 from gpu_router.packaging.estimate import Estimate, estimate
-from gpu_router.packaging.files import FileSelection, GitError, ProjectFile, select_files
+from gpu_router.packaging.files import (
+    FileSelection,
+    GitError,
+    IncludeError,
+    LeftOut,
+    ProjectFile,
+    human_bytes,
+    left_out,
+    select_files,
+)
 
 if TYPE_CHECKING:
     from gpu_router.models import JobSpec
@@ -71,6 +81,7 @@ class Bundle:
     estimate: Estimate
     warnings: list[str] = field(default_factory=list)
     cached: bool = False  # True when an identical bundle was already in the cache
+    selection: FileSelection | None = field(default=None, repr=False, compare=False)
 
 
 def bundles_dir(paths: Paths) -> Path:
@@ -97,12 +108,15 @@ def _size_guard(sel: FileSelection, max_mb: float) -> None:
         return
     biggest = sorted(sel.files, key=lambda f: (-f.size, f.rel))[:5]
     listing = ", ".join(f"{f.rel} ({_mb(f.size)})" for f in biggest)
+    hint = (
+        "add large files (datasets, weights, outputs) to .gitignore and pass datasets "
+        "with `data:` so they upload once to HF Hub instead of every run"
+    )
+    if sel.included:
+        hint = f"`include:` adds {_mb(sel.included_bytes)}: narrow it, or {hint}"
     raise BundleTooLarge(
         f"code bundle would be {_mb(total)}, over the {max_mb:g} MB limit; biggest: {listing}",
-        hint=(
-            "add large files (datasets, weights, outputs) to .gitignore and pass datasets "
-            "with `data:` so they upload once to HF Hub instead of every run"
-        ),
+        hint=hint,
         detail={
             "bytes": total,
             "limit_mb": max_mb,
@@ -120,7 +134,7 @@ def _entry_warnings(spec: JobSpec, sel: FileSelection, project: Path) -> list[st
     if (project / spec.script).is_file():
         return [
             f"{spec.script} exists but is ignored by git, so it will not ship; "
-            "commit it or un-ignore it"
+            "commit it, un-ignore it or add it to gpu.yaml `include:`"
         ]
     return [f"{spec.script} is not in the project; the job will fail to start"]
 
@@ -145,6 +159,7 @@ def build_manifest(
             "source": sel.source,
             "tree_sha256": tree_sha256,
             "untracked": len(sel.untracked),
+            "included": {"count": len(sel.included), "bytes": sel.included_bytes},  # D60
         },
         "checkpoint_interval_min": spec.checkpoint_interval_min,
         "runner": {
@@ -243,16 +258,7 @@ def build_bundle(
 
         paths = _Paths.from_env()
     project = Path(project_dir)
-    try:
-        sel = select_files(project)
-    except FileNotFoundError as exc:
-        raise BundleError(
-            f"project dir {project} does not exist", hint="run from your project folder"
-        ) from exc
-    except NotADirectoryError as exc:
-        raise BundleError(f"project dir {project} is not a directory") from exc
-    except GitError as exc:
-        raise BundleError(str(exc), hint=exc.hint) from exc
+    sel = _select(project, spec)
     project = project.resolve()
     _size_guard(sel, max_mb)
     shipped = {f.rel for f in sel.files}
@@ -293,7 +299,118 @@ def build_bundle(
         estimate=est,
         warnings=warnings,
         cached=cached,
+        selection=sel,
     )
+
+
+def _select(project: Path, spec: JobSpec) -> FileSelection:
+    """files.select_files with its failures as BundleError (400 invalid_spec + hint)."""
+    try:
+        return select_files(project, spec.include)
+    except FileNotFoundError as exc:
+        raise BundleError(
+            f"project dir {project} does not exist", hint="run from your project folder"
+        ) from exc
+    except NotADirectoryError as exc:
+        raise BundleError(f"project dir {project} is not a directory") from exc
+    except (GitError, IncludeError) as exc:
+        raise BundleError(str(exc), hint=exc.hint) from exc
+
+
+#: The one-line advice that comes with a non-empty `left_out` (D60).
+LEFT_OUT_HINT = (
+    "ignored paths do not ship: add them to gpu.yaml include: (code, small files) or pass "
+    "them as data= (datasets)"
+)
+#: Bundle warnings carried in a summary (each cut to SUMMARY_WARNING_CHARS).
+SUMMARY_WARNINGS = 6
+SUMMARY_WARNING_CHARS = 300
+
+
+def left_out_view(
+    project: str | Path,
+    sel: FileSelection,
+    include: list[str] | tuple[str, ...] = (),
+    data_paths: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """{"left_out": ["data/ (2.1 GB, ignored)", ...], "left_out_not_shown": n, "hint"},
+    or {} when nothing worth naming is left out. Paths the job already passes as data=
+    (`data_paths`, as in the spec) are not named: they reach the GPU that way (seen in the
+    2026-10-04 field test: `data/` was "left out" while `data/rows` was its dataset).
+    Best effort: never raises."""
+    try:
+        items, more = left_out(project, sel, include)
+        root = Path(project).resolve()
+        rels = [r for r in (_rel_to(root, p) for p in data_paths) if r]
+        items = [k for k in (_data_note(i, rels) for i in items) if k is not None]
+    except Exception:  # a summary must never fail the submit it describes
+        return {}
+    if not items:
+        return {}
+    out: dict[str, Any] = {"left_out": [item.text() for item in items]}
+    if more:
+        out["left_out_not_shown"] = more
+    out["hint"] = LEFT_OUT_HINT
+    return out
+
+
+def _rel_to(root: Path, raw: str) -> str | None:
+    """A data path as a project-relative posix path, or None when it is outside."""
+    path = Path(raw).expanduser()
+    path = (path if path.is_absolute() else root / path).resolve()
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def _data_note(item: LeftOut, data_rels: list[str]) -> LeftOut | None:
+    """None when `item` is a data path or inside one; a dir holding one gets a note."""
+    entry = item.path.rstrip("/")
+    if any(entry == r or entry.startswith(r + "/") for r in data_rels):
+        return None
+    inside = [r for r in data_rels if r.startswith(entry + "/")]
+    if not inside:
+        return item
+    return replace(item, why=f"{item.why}; {', '.join(r + '/' for r in inside)} is passed as data=")
+
+
+def bundle_summary(spec: JobSpec, *, max_mb: float = DEFAULT_MAX_BUNDLE_MB) -> dict[str, Any]:
+    """What a submit of `spec` ships and what it leaves out, for agents (gpu_submit,
+    gpu_route): the same file selection the daemon makes, without building the archive.
+    Cheap: one `git ls-files` per question, ignored dirs never walked (sizes within a small
+    budget). Shape: {files, bytes, size, included?: {files, bytes}, left_out?: [str],
+    left_out_not_shown?, hint?, warnings?: [str]} or {error, hint} when the project
+    cannot be packaged (the submit fails with the same error)."""
+    project = Path(spec.project_dir)
+    try:
+        sel = _select(project, spec)
+    except BundleError as exc:
+        return {"error": exc.message, "hint": exc.hint}
+    out: dict[str, Any] = {
+        "files": len(sel.files),
+        "bytes": sel.total_bytes,
+        "size": human_bytes(sel.total_bytes),
+    }
+    if spec.include:
+        out["included"] = {"files": len(sel.included), "bytes": sel.included_bytes}
+    data_paths = [d.path for d in spec.data if d.path]
+    out.update(left_out_view(project, sel, spec.include, data_paths))
+    warnings = [*sel.warnings, *_entry_warnings(spec, sel, project.resolve())]
+    if sel.total_bytes > max_mb * _MB:
+        why = (
+            f"`include:` adds {human_bytes(sel.included_bytes)}: narrow it, and pass datasets "
+            "as data="
+            if sel.included
+            else "pass datasets as data="
+        )
+        warnings.insert(0, f"over the {max_mb:g} MB bundle limit, so the submit is refused; {why}")
+    if warnings:
+        out["warnings"] = [
+            w if len(w) <= SUMMARY_WARNING_CHARS else w[: SUMMARY_WARNING_CHARS - 1] + "…"
+            for w in warnings[:SUMMARY_WARNINGS]
+        ]
+    return out
 
 
 def extract_bundle(archive: Path, dest: Path) -> None:

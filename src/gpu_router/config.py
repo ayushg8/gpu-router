@@ -64,6 +64,9 @@ class CallTimeouts(_Section):
     cancel: float = 60
     quota: float = 60
     healthcheck: float = 60
+    # stage_data: a dataset uploaded to the provider's own store (Kaggle datasets) when
+    # there is no checkpoint storage; big datasets take a while on a home uplink
+    stage_data: float = 3600
 
 
 class EngineConfig(_Section):

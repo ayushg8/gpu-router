@@ -66,11 +66,13 @@ from gpu_router.errors import (
     RateLimited,
     SecretsError,
     StaleState,
+    Unavailable,
 )
 from gpu_router.models import (
     Attempt,
     AttemptPatch,
     Checkpoint,
+    DataRef,
     FailureKind,
     Job,
     JobEvent,
@@ -140,8 +142,12 @@ def remote_ref(attempt: Attempt) -> RemoteRef:
 
 
 def _err_text(exc: BaseException) -> str:
+    """An adapter error's text for events and attempts, redacted again (invariant 12:
+    adapters redact their snippets, this catches one that forgot)."""
+    from gpu_router.secrets import redact
+
     msg = getattr(exc, "message", None) or str(exc) or type(exc).__name__
-    return str(msg)
+    return redact(str(msg))
 
 
 class JobDriver:
@@ -1030,7 +1036,9 @@ class JobDriver:
         except _DataProblem as exc:
             if exc.reroute:
                 self._submit_rejected(
-                    job, attempt, InvalidJob(exc.message, provider=provider, hint=exc.hint)
+                    job,
+                    attempt,
+                    exc.error or InvalidJob(exc.message, provider=provider, hint=exc.hint),
                 )
                 return
             store.transition(
@@ -1064,7 +1072,9 @@ class JobDriver:
                     actor=ACTOR,
                     attempt_id=attempt.id,
                     message=(
-                        f"checkpoint storage cannot be reached before submitting "
+                        f"{exc.message}; retrying for up to {wait} before trying another provider"
+                        if isinstance(exc, _StagePending)
+                        else f"checkpoint storage cannot be reached before submitting "
                         f"({exc.message}); waiting up to {wait} for it before the attempt "
                         f"goes ahead without it"
                     ),
@@ -1557,7 +1567,10 @@ class JobDriver:
                 # it reopens at the persisted line count.
                 self._close_capture()
                 return
-            if st.message and st.message != attempt.remote_message:
+            ended = st.phase not in (RemotePhase.PENDING, RemotePhase.RUNNING)
+            if st.message != attempt.remote_message and (st.message or ended):
+                # an ended run without a final message clears the running one ("setting up
+                # the python env" stayed on a finished attempt, 2026-10-04 field test)
                 attempt = store.update_attempt(attempt.id, AttemptPatch(remote_message=st.message))
             if result.devices:
                 self._check_gpu(job, attempt, result.devices)
@@ -2255,6 +2268,10 @@ class JobDriver:
                 items.append({"mount": ref.mount, "local": str(path)})
                 continue
             if await hub.call(hub.hf) is None or not remote_storage:
+                if self.deps.registry.get(attempt.provider).capabilities.stage_data:
+                    # the provider keeps datasets itself (Kaggle datasets): no storage needed
+                    items.append(await self._stage_on_provider(job, attempt, ref, path, degrade))
+                    continue
                 # the runner downloads the upload with its own storage token: without
                 # storage for this attempt (no HF_TOKEN_REMOTE, D44) it cannot
                 st = hub.status()
@@ -2338,6 +2355,80 @@ class JobDriver:
                 await self._evict_datasets(keep=dig.sha256)
             items.append({"mount": ref.mount, "uri": uri, "sha256": dig.sha256})
         return items
+
+    async def _stage_on_provider(
+        self, job: Job, attempt: Attempt, ref: DataRef, path: Path, degrade: bool
+    ) -> dict[str, str]:
+        """A dataset put in the provider's own store through adapter.stage_data, once per
+        content hash (the adapter reuses an earlier upload). Transient trouble waits like
+        storage trouble (checkpoint.storage_wait_s), then the provider is excluded."""
+        hub = self.deps.checkpoints
+        assert hub is not None
+        store = self.deps.store
+        provider = attempt.provider
+        try:
+            dig = await hub.call(hub.digest, path, bulk=True, limit_s=BULK_TIMEOUT_S)
+        except OSError as exc:
+            where = exc.filename or path
+            raise _DataProblem(
+                f"dataset {ref.mount!r}: cannot read {where} ({exc.strerror or exc})",
+                reroute=False,
+            ) from None
+        key = f"stage:{attempt.id}:{dig.sha256}"
+        if dig.size >= STAGE_NOTE_BYTES and key not in self._noted:
+            # only when the wait is noticeable: a tiny dataset read "putting ..." then
+            # "reusing it" a second later (2026-10-04 field test)
+            self._noted.add(key)
+            store.add_note(
+                job.id,
+                reason=Reason.DATA_UPLOADING,
+                actor=ACTOR,
+                attempt_id=attempt.id,
+                message=(
+                    f"uploading dataset {ref.mount} ({dig.count} files, {_size(dig.size)}) to "
+                    f"{provider} unless the same content is already there; the job starts "
+                    "once it is"
+                ),
+                detail={"mount": ref.mount, "sha256": dig.sha256},
+            )
+        try:
+            staged = await self.deps.caller.stage_data(provider, path, dig.sha256, dig.files)
+        except (Unavailable, RateLimited, AdapterContractViolation) as exc:
+            # invariant 7: a contract violation (a local error inside the adapter) is
+            # treated like Unavailable: wait and retry, then exclude
+            if not degrade:
+                raise _StagePending(
+                    f"dataset {ref.mount!r} is not on {provider} yet ({exc.message})"
+                ) from None
+            raise _DataProblem(
+                f"dataset {ref.mount!r} could not be put on {provider} ({exc.message})",
+                reroute=True,
+                hint=getattr(exc, "hint", None),
+            ) from None
+        except AuthRequired as exc:
+            # a login problem is the provider's, not the job's: mark it (health) and
+            # requeue instead of excluding the provider for this job
+            raise _DataProblem(exc.message, reroute=True, hint=exc.hint, error=exc) from None
+        except AdapterError as exc:
+            raise _DataProblem(
+                f"dataset {ref.mount!r} cannot be put on {provider} ({exc.message})",
+                reroute=True,
+                hint=exc.hint,
+            ) from None
+        store.add_note(
+            job.id,
+            reason=Reason.DATA_UPLOADED if staged.uploaded else Reason.DATA_REUSED,
+            actor=ACTOR,
+            attempt_id=attempt.id,
+            message=(
+                f"uploaded dataset {ref.mount} ({dig.count} files, {_size(dig.size)}) as a "
+                f"{staged.where}; later runs reuse it"
+                if staged.uploaded
+                else f"dataset {ref.mount} is already a {staged.where}; reusing it"
+            ),
+            detail={"mount": ref.mount, "sha256": dig.sha256, "uri": staged.uri},
+        )
+        return {"mount": ref.mount, "uri": staged.uri, "sha256": dig.sha256}
 
     def _record_stored(self, job: Job, found: StoredCheckpoint, why: str) -> Checkpoint | None:
         """Record a checkpoint storage knows about but the captured logs did not (a runner
@@ -2883,15 +2974,41 @@ class _Handoff:
     gave_up: bool = False
 
 
+#: a dataset this big gets a note before stage_data runs (the upload can take minutes)
+STAGE_NOTE_BYTES = 50 * 1024**2
+
+
+def _size(n: int) -> str:
+    from gpu_router.packaging.files import human_bytes
+
+    return human_bytes(n)
+
+
+class _StagePending(StorageError):
+    """A dataset is still on its way to the provider's own store (stage_data was slow or
+    the provider answered "try later"): wait and retry like storage trouble."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=True)
+
+
 class _DataProblem(Exception):
     """A dataset cannot be made available to this attempt. `reroute`: another provider
     may manage (exclude this one); else the job cannot run anywhere as it is."""
 
-    def __init__(self, message: str, *, reroute: bool, hint: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reroute: bool,
+        hint: str | None = None,
+        error: AdapterError | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.reroute = reroute
         self.hint = hint
+        self.error = error  # a definitive submit error to apply as-is (else InvalidJob)
 
 
 def _mb(n: int) -> str:

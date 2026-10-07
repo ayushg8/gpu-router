@@ -24,6 +24,8 @@ gpu.yaml schema, version 1 (every key optional; unknown keys are errors with a s
     data:                         # datasets, mounted under $GPU_DATA_DIR/<mount>
       - {mount: coco, path: data/coco}
       - {mount: wiki, uri: "hf://datasets/me/wiki"}
+    include: [third_party/, "data/crops/*.png"]   # ship these even if git ignores them
+                                  #   (path or list; globs; `**` = any dirs; D60)
     checkpoint_interval_min: 20   # 0 disables checkpoint sync
     interactive: false
     requires_approval: false      # always ask before running
@@ -38,7 +40,8 @@ file's value; `--env K=V` entries are merged over the file's `env` (flag wins pe
 script args given on the command line replace the file's `args` entirely. Passing a script
 on the command line replaces both `script` and `command` from the file, and drops the file's
 `name` unless it is the same entrypoint (or `--name` is given). gpu.yaml's `script` is checked
-to exist whenever it is the entrypoint, with or without script args.
+to exist whenever it is the entrypoint, with or without script args. `--include` entries are
+added to the file's `include:` (both ship).
 
 Errors are `GpuYamlError` / `InvalidSpec` (exit code 2 in the CLI) with messages that name
 the file, the key (and its line), what is wrong and what would be right.
@@ -94,6 +97,11 @@ _KEYS: dict[str, tuple[str, str]] = {
     "secrets": ("secrets", "a list of Keychain secret names"),
     "deps": ("deps", "auto, none, a requirements/pyproject file, or {kind:, file:}"),
     "data": ("data", "a list of {mount:, path:} or {mount:, uri:}"),
+    "include": (
+        "include",
+        "a path or glob relative to the project root, or a list of them, e.g. "
+        '[third_party/, "data/crops/*.png"]',
+    ),
     "checkpoint_interval_min": ("checkpoint_interval_min", "whole minutes, 0 to disable"),
     "interactive": ("interactive", "true or false"),
     "requires_approval": ("requires_approval", "true or false"),
@@ -133,6 +141,7 @@ class Flags:
     source: Source = Source.CLI
     provider_options: dict[str, dict[str, Any]] | None = None
     labels: dict[str, str] = field(default_factory=dict)
+    include: list[str] = field(default_factory=list)  # --include (D60), added to gpu.yaml's
 
 
 # --------------------------------------------------------------------------- project root
@@ -348,6 +357,13 @@ def _convert(path: Path, key: str, value: Any, lines: Mapping[str, int]) -> Any:
         if not isinstance(value, list):
             raise fail(path, key, lines, f"is {type(value).__name__}, not a list")
         return value  # validated as DataRef in build_spec (messages carry the index)
+    if key == "include":
+        # one pattern or a list of them; never shell-split (a glob is one token)
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            return list(value)
+        raise fail(path, key, lines, f"is {value!r}")
     raise AssertionError(key)  # pragma: no cover
 
 
@@ -461,6 +477,9 @@ def build_spec(
         from_flags.add("env")
     if flags.labels:
         values["labels"] = {**values.get("labels", {}), **flags.labels}
+    if flags.include:
+        values["include"] = [*values.get("include", []), *flags.include]
+        from_flags.add("include")
     if flags.provider_options is not None:
         values["provider_options"] = {
             **values.get("provider_options", {}),
@@ -545,6 +564,7 @@ _FLAG_NAMES = {
     "name": "--name",
     "smoke": "--smoke",
     "env": "--env",
+    "include": "--include",
     "script": "the script argument",
     "command": "the command",
     "args": "the script arguments",
@@ -567,15 +587,16 @@ def _from_validation(
     # our own validators (value_error) already explain themselves; type/range errors
     # get a "must be ..." hint
     type_hint = err.get("type") != "value_error"
-    # env is merged from both places; blame the one holding the key the message names
-    # (JobSpec's env validators quote the offending name with repr())
+    # env and include are merged from both places; blame the one holding the entry the
+    # message names (their validators quote the offending name / pattern with repr())
+    given = {"env": list(flags.env), "include": [p.strip() for p in flags.include]}
     if (
-        top == "env"
+        top in given
         and top in from_flags
-        and "env" in doc.values
-        and not any(repr(k) in msg for k in flags.env)
+        and top in doc.values
+        and not any(repr(k) in msg for k in given[top])
     ):
-        from_flags = from_flags - {"env"}
+        from_flags = from_flags - {top}
     if top in from_flags:
         flag = _FLAG_NAMES.get(top, top)
         expected = _KEYS.get(_FILE_KEYS.get(top, top), ("", "valid"))[1]

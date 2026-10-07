@@ -274,6 +274,11 @@ class JobSpec(_Frozen):
     secrets: list[str] = Field(default_factory=list)  # keyring names exposed as env
     deps: DepsSpec = Field(default_factory=DepsSpec)
     data: list[DataRef] = Field(default_factory=list)
+    include: list[str] = Field(default_factory=list, exclude_if=lambda v: not v)
+    """D60: paths or globs relative to project_dir that ship although git ignores them or
+    lists them only as a whole (a cloned third_party/ repo). The credential, symlink and
+    size rules still apply (packaging/files.py). Left out of dumps while empty, so specs
+    without it serialize (and hash) exactly as before and older daemons accept them."""
 
     checkpoint_interval_min: int = Field(default=20, ge=0, le=24 * 60)  # 0 disables sync
     interactive: bool = False
@@ -343,6 +348,21 @@ class JobSpec(_Frozen):
             if not _ENV_NAME.match(key):
                 raise ValueError(f"invalid secret name: {key!r}")
         return v
+
+    @field_validator("include")
+    @classmethod
+    def _include_patterns(cls, v: list[str]) -> list[str]:
+        """Relative paths/globs inside the project, normalized and deduplicated (D60)."""
+        from gpu_router.packaging.files import MAX_INCLUDE_PATTERNS, normalize_include
+
+        if len(v) > MAX_INCLUDE_PATTERNS:
+            raise ValueError(f"include has {len(v)} entries; at most {MAX_INCLUDE_PATTERNS}")
+        out: list[str] = []
+        for raw in v:
+            norm = normalize_include(raw)
+            if norm not in out:
+                out.append(norm)
+        return out
 
     @model_validator(mode="after")
     def _one_entrypoint(self) -> JobSpec:

@@ -450,3 +450,41 @@ async def test_secret_is_passed_to_adapter(eng: Engine) -> None:
     assert "wandb-secret-value-123" not in json.dumps(
         [e.model_dump(mode="json") for e in eng.store.events_for(job.id)]
     )
+
+
+async def test_an_ended_run_without_a_final_message_drops_the_running_one(
+    eng: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-04 field test: a finished local attempt still said "setting up the python
+    env" (status() of an ended run had no message, so the running one stayed)."""
+    from gpu_router.adapters.base import RemotePhase
+
+    fake = eng.fake()
+    real = fake.status
+
+    def no_final_message(ref: Any) -> Any:
+        st = real(ref)
+        return st if st.phase is RemotePhase.RUNNING else st.model_copy(update={"message": None})
+
+    monkeypatch.setattr(fake, "status", no_final_message)
+    job = await eng.submit(fake={"duration": 5, "steps": 5})
+    done = await eng.until_terminal(job.id)
+    assert done.state is JobState.DONE
+    (attempt,) = eng.store.attempts_for(job.id)
+    assert attempt.remote_message is None
+
+
+def test_adapter_error_text_is_redacted_before_it_is_stored() -> None:
+    """2026-10-05: a kaggle fetch error carried a signed download URL (a JWE) into the job's
+    events; the driver redacts adapter error text itself too (invariant 12)."""
+    from gpu_router.engine.driver import _err_text
+    from gpu_router.errors import Unavailable
+    from tests.unit.core.test_secrets import JWE
+
+    exc = Unavailable(
+        f"kaggle is unreachable (kernels output): host='kaggleusercontent' url: /kf/1/{JWE}",
+        provider="kaggle",
+    )
+    text = _err_text(exc)
+    assert "eyJ" not in text
+    assert text.endswith("url: /kf/1/***")

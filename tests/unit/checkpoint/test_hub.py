@@ -301,3 +301,28 @@ def test_a_new_token_is_picked_up_without_a_restart(paths: Paths, clock: FakeClo
     clock.advance(301)
     assert hub.hf() is None
     assert hub.status().reason == "no Hugging Face token in the Keychain"
+
+
+def test_remote_data_possible_follows_the_cached_state(paths: Paths, clock: FakeClock) -> None:
+    """The routing path's question (D61): may a job's data= reach a remote runner through
+    HF? Never decided by a network call, never "no" for trouble that should pass."""
+    assert not make_hub(paths, clock, backend="local").remote_data_possible()
+    api = FakeHfApi()
+    hub = make_hub(paths, clock, api)
+    assert hub.remote_data_possible()  # not tried yet: do not rule anything out
+    assert hub.hf() is None  # no token: refused
+    assert not hub.remote_data_possible()
+    clock.advance(61)  # past the refusal's pause: a new `gpu login hf` must count
+    assert hub.remote_data_possible()
+    hub._hf_failed("hf storage did not answer", None, 60, transient=True)
+    assert hub.remote_data_possible()  # a network blip: the placement waits instead
+    secrets.set_secret("HF_TOKEN", TOKEN)
+    clock.advance(61)
+    assert hub.hf() is not None
+    assert hub.remote_data_possible()
+    # the bucket is fine but remote runners have no token (HF_TOKEN without _REMOTE)
+    assert hub.prepare_attempt(job_id="j1", attempt_n=1, kind="kaggle", resume=None) is None
+    assert not hub.remote_data_possible()
+    secrets.set_secret("HF_TOKEN_REMOTE", REMOTE)
+    assert hub.prepare_attempt(job_id="j1", attempt_n=2, kind="kaggle", resume=None) is not None
+    assert hub.remote_data_possible()

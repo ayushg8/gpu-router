@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 import pytest
@@ -43,6 +44,15 @@ def test_longest_registered_value_wins() -> None:
     assert secrets.redact("x abcdefghij y") == "x *** y"
 
 
+def _b64(raw: str) -> str:
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+# JWE / JWT shapes from synthetic parts (never a real token, never a literal one)
+JWE = ".".join([_b64('{"alg":"dir","enc":"A128CBC-HS256"}'), "", "A" * 22, "B" * 40, "C" * 22])
+JWT = ".".join([_b64('{"alg":"none"}'), _b64('{"test":1}'), "x" * 12])
+
+
 @pytest.mark.parametrize(
     ("text", "want"),
     [
@@ -54,6 +64,11 @@ def test_longest_registered_value_wins() -> None:
         ("api_key=abcd1234 rest", "api_key=*** rest"),
         ('{"username": "me", "key": "' + "0" * 32 + '"}', '{"username": "me", "key": "***"}'),
         ("password: hunter22", "password: ***"),
+        # a signed download URL shaped like Kaggle's (a JWE: empty 2nd part), built from
+        # synthetic parts so no token-shaped literal sits in the source
+        ("url: /kf/1/" + JWE + " (Caused by", "url: /kf/1/*** (Caused by"),
+        ("jwt " + JWT + " end", "jwt *** end"),
+        ("the keyJam word stays", "the keyJam word stays"),
         ("nothing to see", "nothing to see"),
         ("", ""),
     ],

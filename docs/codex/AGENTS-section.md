@@ -76,12 +76,25 @@ CPU work local. Try a new training script first with `smoke: true` (runs on this
 - Safe to retry: the same call while that job is still active returns it
   (`submitted: false`) instead of starting a second copy.
 - Optional: `vram_gb` (hard minimum), `gpu` (e.g. T4), `env` (non-secret variables only),
-  `data` (`[NAME=]PATH` datasets, uploaded once and cached), `name`, `smoke`. Leave
-  `provider` unset unless the user asked for one.
+  `data` (`[NAME=]PATH` datasets, uploaded once and cached), `include` (see below), `name`,
+  `smoke`. Leave `provider` unset unless the user asked for one. To run on this Mac through
+  gpu-router's queue (one job at a time, so parallel agents do not fight over the GPU), pin
+  `provider="local"`; unpinned, the Mac only takes smoke tests.
+- Big files the job needs every run (model weights, datasets) go in `data`, not in a
+  download inside the script: Kaggle keeps each one as a private dataset, uploaded once and
+  reused by every later job (re-downloading 7 GB from Google Drive per retry got
+  rate-limited). Without Hugging Face storage only Kaggle and this Mac can take `data`; the
+  router knows and picks accordingly.
 - Preview long or big-VRAM jobs with `gpu_route(...)` (same arguments): where it would run,
   why, and whether approval would be needed.
+- **Git-ignored files do not ship.** Both results carry `bundle`: files and bytes that ship,
+  and `bundle.left_out` = ignored paths that do not (`data/ (2.1 GB, ignored)`,
+  `third_party/ (ignored)`). If the job needs one, pass `include=["third_party/"]` (code,
+  small files; globs like `experiments/**/out` work; nested git repos ship too) or
+  `data=[...]` (datasets). Check with `gpu_route` before submitting.
 - `gpu.yaml` at the project root holds defaults (`script`, `args`, `hours`, `vram`,
-  `checkpoint_interval_min`, `secrets`, `data`, `env`); tool arguments override it.
+  `checkpoint_interval_min`, `secrets`, `data`, `include`, `env`); tool arguments override
+  it (`include` adds to the file's).
   Dependencies come from requirements.txt or pyproject.toml. Secrets live in the Keychain
   (`gpu secrets set NAME`, run by the user) and are listed under `secrets:`; never put them
   in `env`.
