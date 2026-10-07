@@ -387,6 +387,15 @@ def check_launchd(env: ProbeEnv) -> CheckResult:
             f"the agent runs {program or '(nothing)'}, which no longer exists",
             "gpu daemon install-launchd",
         )
+    if agent.get("ProcessType") == "Background":
+        # an agent written before 2026-10-06: macOS starves it whenever the Mac is busy
+        return _r(
+            *t,
+            WARN,
+            "the launchd agent runs the daemon at background priority, so macOS starves it "
+            "(and the provider CLIs it starts) while the Mac is busy",
+            "gpu daemon install-launchd",
+        )
     uid = os.getuid()
     res = env.run(["/bin/launchctl", "print", f"gui/{uid}/{LABEL}"], env.remaining(5))
     if not res.ok:

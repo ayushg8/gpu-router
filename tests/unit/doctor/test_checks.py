@@ -75,8 +75,12 @@ def test_version_mismatch_says_restart(make_env: MakeEnv) -> None:
     assert checks.check_daemon_version(make_env()).status is SKIP
 
 
-def _plist(env: ProbeEnv, *, program: str, home: Path | None) -> None:
+def _plist(
+    env: ProbeEnv, *, program: str, home: Path | None, process_type: str | None = None
+) -> None:
     agent: dict[str, Any] = {"Label": "dev.gpu-router.daemon", "ProgramArguments": [program]}
+    if process_type is not None:
+        agent["ProcessType"] = process_type
     if home is not None:
         agent["EnvironmentVariables"] = {"GPU_ROUTER_HOME": str(home)}
     assert env.launchd_plist is not None
@@ -101,6 +105,24 @@ def test_launchd_agent_for_this_home(make_env: MakeEnv, paths: Paths, tmp_path: 
     r = checks.check_launchd(env)
     assert r.status is OK
     assert "pid 4242" in r.summary
+
+
+def test_launchd_agent_at_background_priority_is_a_warning(
+    make_env: MakeEnv, paths: Paths, tmp_path: Path
+) -> None:
+    """2026-10-06: an agent with ProcessType Background got 1 s of CPU in 14 minutes while
+    the Mac was busy; agents written before the fix are flagged with the reinstall."""
+    program = write(tmp_path / "bin" / "gpu", "#!/bin/sh\n", 0o755)
+    printed = ok("dev.gpu-router.daemon = {\n\tstate = running\n\tpid = 4242\n}\n")
+    run = default_run().on(r"launchctl print gui/\d+/dev.gpu-router.daemon", printed)
+    env = make_env(run=run, daemon=daemon_up(FakeClient(), pid=4242))
+    _plist(env, program=str(program), home=paths.home, process_type="Background")
+    r = checks.check_launchd(env)
+    assert r.status is WARN
+    assert "background priority" in r.summary
+    assert r.fix == "gpu daemon install-launchd"
+    _plist(env, program=str(program), home=paths.home, process_type="Standard")
+    assert checks.check_launchd(env).status is OK
 
 
 def test_launchd_installed_but_not_loaded(make_env: MakeEnv, paths: Paths, tmp_path: Path) -> None:

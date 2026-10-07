@@ -2174,3 +2174,19 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   (`driver.FETCH_RETRY_S`, A9 makes fetch re-runnable) before the `fetch_failed` note, which
   then says "after 3 tries"; definitive errors are not retried; the supervisor's manual
   re-fetch redacts its error text too.
+- **D62** (launchd priority, found live 2026-10-06) The launchd agent had `ProcessType:
+  Background`, so macOS ran the daemon, and every provider CLI it starts, at background QoS.
+  On a busy Mac (load 95-245 from other projects) it got 1 s of CPU in 14 minutes: health
+  checks timed out (`kaggle --version` > 15 s, `colab sessions`), `/v1/health` stopped
+  answering and a restart took over 25 minutes to come up; that is exactly when agents send
+  work to cloud GPUs. `render_plist` now writes `ProcessType: Standard` (the daemon idles
+  between polls, so normal priority costs the foreground nothing); `taskpolicy -B` on the
+  running process was not enough. Doctor's launchd row warns about an agent still at
+  Background priority, fix `gpu daemon install-launchd`. Also `launchd.install` retries
+  `launchctl bootstrap` while it answers 5 (Input/output error) right after the bootout,
+  with 2/4/8/16 s pauses (`BOOTSTRAP_RETRY_S`, injectable `sleep`): the first re-install
+  left the agent unloaded because the starved old daemon had not exited yet. Verified live:
+  the re-installed agent shows `spawn type = daemon` (was `background`) and answered ready
+  ~5 s after bootstrap at load 139. Tests: `tests/api/test_daemon_units.py` (plist +
+  bootstrap retry), `tests/unit/doctor/test_checks.py::test_launchd_agent_at_background_
+  priority_is_a_warning`.

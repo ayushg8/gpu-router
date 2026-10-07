@@ -168,6 +168,15 @@ redacts adapter error text before storing it (`tests/unit/core/test_secrets.py`,
 `tests/unit/engine/test_flows.py::test_adapter_error_text_is_redacted_before_it_is_stored`).
 The stored note holds an expired link and stays (events are append-only).
 
+### The daemon starved on a busy Mac (2026-10-06, D62)
+
+With other projects loading the Mac (load 95-245: Postgres imports, ffmpeg, local model
+runs), the daemon got 1 s of CPU in 14 minutes and stopped answering; provider checks timed
+out. Cause: the launchd agent ran it with `ProcessType: Background`. Now `Standard`; the
+re-installed agent answered ready ~5 s after bootstrap at load 139. `gpu daemon
+install-launchd` also retries the bootstrap while launchd still tears down the old daemon
+(it had answered error 5 and left the agent unloaded).
+
 ## Still open
 
 - **Lightning needs a fresh sign-in by the user**: `gpu login lightning --browser` (or
