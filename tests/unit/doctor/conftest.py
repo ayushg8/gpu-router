@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from gpu_router import __version__
 from gpu_router.api import HealthView
 from gpu_router.clock import FakeClock
 from gpu_router.doctor.probe import CmdResult, DaemonInfo, ProbeEnv
@@ -147,7 +148,7 @@ def daemon_up(
     client: FakeClient, *, pid: int = 4242, test_mode: bool = False, **kw: Any
 ) -> DaemonInfo:
     health = HealthView(
-        version=kw.pop("version", "0.1.0"),
+        version=kw.pop("version", __version__),
         ready=kw.pop("ready", True),
         pid=pid,
         started_at=kw.pop("started_at", 1_000.0),

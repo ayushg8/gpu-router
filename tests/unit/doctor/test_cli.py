@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from gpu_router import __version__
 from gpu_router.cli.app import Out, main
 from gpu_router.doctor import cli as doctor_cli
 from gpu_router.doctor.model import DriftItem, Report
@@ -85,7 +86,7 @@ def test_human_output(capsys: pytest.CaptureFixture[str], daemon: InProcDaemon) 
 
 def _report(drift: list[DriftItem]) -> Report:
     return Report(
-        version="0.1.0",
+        version=__version__,
         home="/x",
         checked_at=0,
         elapsed_ms=1,

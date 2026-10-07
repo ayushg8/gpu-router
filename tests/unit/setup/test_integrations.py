@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from gpu_router import __version__
 from gpu_router.setup import integrations
 from gpu_router.setup.base import Outcome
 from tests.unit.setup.conftest import Sandbox, ScriptedUi, fail, ok
@@ -82,7 +83,7 @@ def test_statusline_dry_run(sandbox: Sandbox) -> None:
 # =========================================================================== plugin
 
 
-def _claude_installs(sandbox: Sandbox, version: str = "0.1.0") -> None:
+def _claude_installs(sandbox: Sandbox, version: str = __version__) -> None:
     plugins = sandbox.user_home / ".claude" / "plugins"
 
     def add(_argv: list[str], _env: Any) -> Any:
@@ -129,7 +130,7 @@ def test_plugin_disabled_is_enabled(sandbox: Sandbox) -> None:
     sandbox.tools["claude"] = "/fake/bin/claude"
     sandbox.write(
         ".claude/plugins/installed_plugins.json",
-        json.dumps({"plugins": {"gpu-router@gpu-router-local": [{"version": "0.1.0"}]}}),
+        json.dumps({"plugins": {"gpu-router@gpu-router-local": [{"version": __version__}]}}),
     )
     sandbox.write(
         ".claude/settings.json",
@@ -165,7 +166,7 @@ def test_plugin_from_github_is_updated_through_its_own_marketplace(sandbox: Sand
     def update(_argv: list[str], _env: Any) -> Any:
         sandbox.write(
             ".claude/plugins/installed_plugins.json",
-            json.dumps({"plugins": {key: [{"version": "0.1.0"}]}}),
+            json.dumps({"plugins": {key: [{"version": __version__}]}}),
         )
         return ok()
 

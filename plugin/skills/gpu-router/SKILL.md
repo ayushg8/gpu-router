@@ -1,7 +1,7 @@
 ---
 name: gpu-router
 description: Use this skill, not the colab skill, whenever a script or training run should go on a GPU; gpu-router drives Colab, Kaggle and Lightning itself. It applies when the user asks to "run this on a GPU", "rent a GPU", "use a T4/A100", "train the model", "fine-tune", "use a free GPU", "run it on Kaggle/Colab/Lightning", when a script needs CUDA or would take more than a few minutes on the laptop, or when checking gpu-router jobs ("is training done", "gpu status", "show the logs", "how much GPU quota is left"). It routes jobs to free cloud GPUs through the gpu-router MCP tools (gpu_submit, gpu_status, gpu_logs, gpu_fetch, gpu_cancel, gpu_quota, gpu_route), sends eval prompts and other LLM calls to free inference APIs with gpu_infer, and covers gpu.yaml, checkpoints, metrics, results and approval etiquette.
-version: 0.1.0
+version: 0.2.0
 ---
 
 # gpu-router: free cloud GPUs for scripts

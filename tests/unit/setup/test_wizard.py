@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from gpu_router import secrets
+from gpu_router import __version__, secrets
 from gpu_router.errors import InvalidRequest
 from gpu_router.setup import check
 from gpu_router.setup.base import Options, Outcome
@@ -75,7 +75,7 @@ def _world(sandbox: Sandbox) -> None:
         return ok()
 
     def install(_a: list[str], _e: Any) -> Any:
-        doc = {"plugins": {"gpu-router@gpu-router-local": [{"version": "0.1.0"}]}}
+        doc = {"plugins": {"gpu-router@gpu-router-local": [{"version": __version__}]}}
         (plugins / "installed_plugins.json").write_text(json.dumps(doc))
         return ok()
 
