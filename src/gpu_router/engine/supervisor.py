@@ -43,7 +43,7 @@ from gpu_router.api import ProviderView
 from gpu_router.engine._obs import emit, fmt_duration
 from gpu_router.engine.backoff import backoff_s
 from gpu_router.engine.context import build_routing_context, quota_views
-from gpu_router.engine.driver import ADAPTER_FAILURES, JobDriver, remote_ref
+from gpu_router.engine.driver import ADAPTER_FAILURES, JobDriver, _err_text, remote_ref
 from gpu_router.errors import InvalidSpec, InvalidTransition, StaleState
 from gpu_router.models import (
     Job,
@@ -561,7 +561,7 @@ class Supervisor:
                 attempt_id=attempt_id,
                 message=(
                     f"could not fetch outputs from {attempt.provider} "
-                    f"({getattr(exc, 'message', exc)}); try again later"
+                    f"({_err_text(exc)}); try again later"
                 ),
                 detail={"error": type(exc).__name__},
             )

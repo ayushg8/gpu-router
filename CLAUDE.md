@@ -2169,4 +2169,8 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   Kaggle's signed download URL: a JWE (`eyJ...` with an empty second part) no pattern knew.
   `secrets.TOKEN_PATTERNS` now redacts JWT/JWE, and the driver's `_err_text` redacts every
   adapter error text it stores (invariant 12, defence in depth). The note already stored
-  holds an expired link and stays (events are append-only).
+  holds an expired link and stays (events are append-only). (9) Output fetches retry
+  transient failures (Unavailable, RateLimited, contract violations) after 20 s and 60 s
+  (`driver.FETCH_RETRY_S`, A9 makes fetch re-runnable) before the `fetch_failed` note, which
+  then says "after 3 tries"; definitive errors are not retried; the supervisor's manual
+  re-fetch redacts its error text too.

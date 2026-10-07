@@ -107,6 +107,14 @@ ACTOR = "engine"
 OVERRUN = "overrun"
 
 #: Exceptions an adapter round trip may legitimately end with (anything else is a bug).
+#: pauses between output-fetch tries after a transient failure (3 tries over ~80 s)
+FETCH_RETRY_S: tuple[float, ...] = (20.0, 60.0)
+_FETCH_TRANSIENT: tuple[type[Exception], ...] = (
+    Unavailable,
+    RateLimited,
+    AdapterContractViolation,
+)
+
 ADAPTER_FAILURES: tuple[type[Exception], ...] = (
     AdapterError,
     AdapterContractViolation,
@@ -2071,21 +2079,31 @@ class JobDriver:
         if job.outputs_dir is None or attempt.remote_id is None:
             return False
         dest = Path(job.outputs_dir)
-        try:
-            res = await self.deps.caller.fetch(attempt.provider, remote_ref(attempt), dest)
-        except ADAPTER_FAILURES as exc:
-            store.add_note(
-                job.id,
-                reason=Reason.FETCH_FAILED,
-                actor=ACTOR,
-                attempt_id=attempt.id,
-                message=(
-                    f"could not fetch outputs from {attempt.provider} "
-                    f"({_err_text(exc)}); retry with `gpu fetch {job.short_id}`"
-                ),
-                detail={"error": type(exc).__name__},
-            )
-            return False
+        tries = len(FETCH_RETRY_S) + 1
+        for n in range(tries):
+            try:
+                res = await self.deps.caller.fetch(attempt.provider, remote_ref(attempt), dest)
+                break
+            except ADAPTER_FAILURES as exc:
+                # a network blip on the download host must not leave outputs behind
+                # (2026-10-05: one transient error, the manual retry got all 781 files);
+                # A9 makes fetch safe to re-run. Definitive errors are not retried.
+                if n + 1 < tries and isinstance(exc, _FETCH_TRANSIENT):
+                    await self.sleep(FETCH_RETRY_S[n])
+                    continue
+                after = f" after {n + 1} tries" if n else ""
+                store.add_note(
+                    job.id,
+                    reason=Reason.FETCH_FAILED,
+                    actor=ACTOR,
+                    attempt_id=attempt.id,
+                    message=(
+                        f"could not fetch outputs from {attempt.provider}{after} "
+                        f"({_err_text(exc)}); retry with `gpu fetch {job.short_id}`"
+                    ),
+                    detail={"error": type(exc).__name__, "tries": n + 1},
+                )
+                return False
         partial = f"; partial: {res.message}" if res.partial and res.message else ""
         store.add_note(
             job.id,

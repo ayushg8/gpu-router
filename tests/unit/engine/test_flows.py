@@ -488,3 +488,69 @@ def test_adapter_error_text_is_redacted_before_it_is_stored() -> None:
     text = _err_text(exc)
     assert "eyJ" not in text
     assert text.endswith("url: /kf/1/***")
+
+
+class _FlakyFetch:
+    """Wraps a FakeAdapter's fetch: raises `errors` first (one per call), then delegates."""
+
+    def __init__(self, real: Any, errors: list[Exception]) -> None:
+        self.real = real
+        self.errors = list(errors)
+        self.calls = 0
+
+    def __call__(self, ref: Any, dest: Any) -> Any:
+        self.calls += 1
+        if self.errors:
+            raise self.errors.pop(0)
+        return self.real(ref, dest)
+
+
+async def test_a_transient_fetch_failure_is_retried(
+    eng: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-10-05: one network blip on Kaggle's download host left a finished job without
+    its outputs until someone ran `gpu fetch`; transient failures are retried now."""
+    from gpu_router.errors import Unavailable
+
+    fake = eng.fake()
+    flaky = _FlakyFetch(fake.fetch, [Unavailable("connection reset", provider="fake")] * 2)
+    monkeypatch.setattr(fake, "fetch", flaky)
+    job = await eng.submit(fake={"duration": 5, "steps": 5})
+    done = await eng.until_terminal(job.id)
+    assert done.state is JobState.DONE
+    assert done.outputs_fetched
+    assert flaky.calls == 3
+    assert Reason.FETCH_FAILED not in eng.reasons(job.id)
+
+
+async def test_fetch_gives_up_after_three_tries_and_says_so(
+    eng: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_router.errors import Unavailable
+
+    fake = eng.fake()
+    flaky = _FlakyFetch(fake.fetch, [Unavailable("connection reset", provider="fake")] * 5)
+    monkeypatch.setattr(fake, "fetch", flaky)
+    job = await eng.submit(fake={"duration": 5, "steps": 5})
+    done = await eng.until_terminal(job.id)
+    assert done.state is JobState.DONE
+    assert not done.outputs_fetched
+    assert flaky.calls == 3
+    (note,) = [e for e in eng.store.events_for(job.id) if e.reason == Reason.FETCH_FAILED]
+    assert "after 3 tries" in note.message
+    assert f"gpu fetch {job.short_id}" in note.message
+
+
+async def test_a_definitive_fetch_error_is_not_retried(
+    eng: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from gpu_router.errors import NotFound
+
+    fake = eng.fake()
+    flaky = _FlakyFetch(fake.fetch, [NotFound("outputs are gone", provider="fake")])
+    monkeypatch.setattr(fake, "fetch", flaky)
+    job = await eng.submit(fake={"duration": 5, "steps": 5})
+    done = await eng.until_terminal(job.id)
+    assert done.state is JobState.DONE
+    assert flaky.calls == 1
+    assert not done.outputs_fetched
