@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import difflib
 import os
+import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -400,8 +401,31 @@ def parse_env_pairs(pairs: Sequence[str]) -> dict[str, str]:
     return out
 
 
+def _names_file(project_root: Path, cwd: Path, token: str) -> bool:
+    candidates = [Path(token)] if os.path.isabs(token) else [cwd / token, project_root / token]
+    return any(c.is_file() for c in candidates)
+
+
 def _entrypoint(project_root: Path, cwd: Path, token: str, args: list[str]) -> dict[str, Any]:
-    """A positional entrypoint -> {"script"} for a .py file, else {"command"}."""
+    """A positional entrypoint -> {"script", "args"} for a .py file, else {"command"}.
+
+    A whole command line in one string (an agent's `script="bash jobs/build.sh"`, a quoted
+    `gpu run "python train.py --fast"`) is split like a shell would, unless it names an
+    existing file: kept as one word it was exec'd as a program called "bash jobs/build.sh"
+    and failed with exit 127 (2026-10-08)."""
+    if any(ch.isspace() for ch in token) and not _names_file(project_root, cwd, token):
+        try:
+            words = shlex.split(token)
+        except ValueError as exc:
+            raise InvalidSpec(
+                f"cannot split the command line {token!r}: {exc}",
+                hint="pass the program and its arguments separately: script=bash, "
+                "args=[run.sh, ...]",
+                detail={"script": token},
+            ) from None
+        if not words:
+            raise InvalidSpec("the script is empty", detail={"script": token})
+        return _entrypoint(project_root, cwd, words[0], [*words[1:], *args])
     if token.endswith(".py"):
         local = (cwd / token).resolve() if not os.path.isabs(token) else Path(token).resolve()
         try:
@@ -418,7 +442,7 @@ def _entrypoint(project_root: Path, cwd: Path, token: str, args: list[str]) -> d
                 hint="check the path; it is relative to the current directory",
                 detail={"script": rel.as_posix(), "project_dir": str(project_root)},
             )
-        return {"script": rel.as_posix(), "command": None}
+        return {"script": rel.as_posix(), "command": None, "args": args}
     return {"script": None, "command": [token, *args]}
 
 
@@ -448,9 +472,7 @@ def build_spec(
             # gpu.yaml's `name` describes gpu.yaml's entrypoint, not the one typed here
             values.pop("name", None)
         values.update(entry)
-        if entry["script"] is not None:
-            values["args"] = args
-        else:
+        if entry["script"] is None:
             values.pop("args", None)
         from_flags.update({"script", "command", "args"})
     else:

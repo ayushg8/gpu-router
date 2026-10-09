@@ -51,6 +51,7 @@ gpu run train.py --epochs 3 --json               # a few gpu options still work 
 gpu run --epochs 3                               # script from gpu.yaml, args from the command line
 gpu run train.py -- --vram 1                     # everything after -- goes to the script verbatim
 gpu run bash scripts/train.sh --fast             # non-.py entrypoint = command run from the project root
+gpu run "bash scripts/train.sh --fast"           # one quoted command line is split like a shell would
 ```
 
 Flags: `--vram GB`, `--hours H`, `--provider/-p NAME`, `--gpu TYPE`, `--name NAME`,

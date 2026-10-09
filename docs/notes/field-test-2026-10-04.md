@@ -186,6 +186,15 @@ default credentials found" (exit 0) when the credential refresh cannot reach Goo
 text as an expired sign-in. An auth-looking colab failure now counts as a login problem only
 while oauth2.googleapis.com answers; otherwise it is an outage ("the network looks down").
 
+### Real agent jobs (2026-10-08, D64)
+
+Other sessions now use the router for real work (15 jobs between 03:00 and 06:10 UTC: 11
+done on local, kaggle and colab; 3 failed; 1 cancelled by its owner). Two of the failures
+were gpu-router's to fix: `script="bash .../build.sh"` ran as a program named
+"bash .../build.sh" (exit 127; now split like a shell), and an argument naming a git-ignored
+file failed on the GPU (gpu_submit / gpu_route / `gpu run --dry-run` now name such arguments
+with the fix). The third was the script's own error.
+
 ## Still open
 
 - **Lightning needs a fresh sign-in by the user**: `gpu login lightning --browser` (or
