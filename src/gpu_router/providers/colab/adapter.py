@@ -75,6 +75,7 @@ from gpu_router.errors import (
     Unavailable,
 )
 from gpu_router.models import Job, ProviderHealth, QuotaSnapshot
+from gpu_router.providers.colab import cli as colab_cli
 from gpu_router.providers.colab import remote
 from gpu_router.providers.colab.cli import (
     ADC_HINT,
@@ -381,7 +382,7 @@ class ColabAdapter(Adapter):
         if not res.ok:
             if session_gone(res):
                 raise SessionGone(res.tail())
-            raise classify(res, provider=self.name, op=f"exec {script}")
+            raise self._classify(res, op=f"exec {script}")
         try:
             return remote.parse_result(res.stdout)
         except remote.RemoteScriptError as exc:
@@ -401,7 +402,7 @@ class ColabAdapter(Adapter):
             return
         if session_gone(res):
             raise SessionGone(res.tail())
-        raise classify(res, provider=self.name, op=op)
+        raise self._classify(res, op=op)
 
     def _download(
         self, cli: ColabCli, session: str, remote_path: str, local: Path, *, timeout: float
@@ -442,7 +443,7 @@ class ColabAdapter(Adapter):
         text = res.text
         if session_gone(res) or "Not Found" in text or " 404" in text:
             return
-        raise classify(res, provider=self.name, op="stop")
+        raise self._classify(res, op="stop")
 
     def _stop_quietly(self, cli: ColabCli | None, rec: RunRecord, *, timeout: float) -> bool:
         if rec.stopped:
@@ -659,7 +660,7 @@ class ColabAdapter(Adapter):
         )
         rec.cli_pid = None  # returned (or killed at the timeout): no longer in flight
         if not res.ok:
-            err = classify(res, provider=self.name, op="new", gpu=gpu, now=self.clock.now())
+            err = self._classify(res, op="new", gpu=gpu, now=self.clock.now())
             if isinstance(err, DEFINITIVE_SUBMIT_ERRORS) and not res.timed_out:
                 rec.state = RunState.REJECTED
                 rec.stopped = True  # nothing was created
@@ -1472,11 +1473,9 @@ class ColabAdapter(Adapter):
                 checked_at=now,
             )
         if not res.ok or "No valid default credentials" in res.text:
-            err = (
-                AuthRequired("no valid Google application-default credentials", hint=ADC_HINT)
-                if "No valid default credentials" in res.text
-                else classify(res, provider=self.name, op="sessions")
-            )
+            err = self._classify(res, op="sessions")
+            if isinstance(err, AuthRequired) and "No valid default credentials" in res.text:
+                err = AuthRequired("no valid Google application-default credentials", hint=ADC_HINT)
             health = (
                 ProviderHealth.AUTH_REQUIRED
                 if isinstance(err, AuthRequired)
@@ -1498,6 +1497,15 @@ class ColabAdapter(Adapter):
                 detail=detail,
             )
         return Health(health=ProviderHealth.OK, checked_at=now, detail=detail)
+
+    def _classify(self, res: CliResult, *, op: str, **kw: Any) -> AdapterError:
+        """`classify` with the reachability probe: an auth-looking failure while Google's
+        token endpoint is unreachable is an outage, not a login problem."""
+        return classify(res, provider=self.name, op=op, reachable=self._google_reachable, **kw)
+
+    @staticmethod
+    def _google_reachable() -> bool:
+        return colab_cli.google_reachable()  # looked up per call: tests replace it
 
     @staticmethod
     def _adc_present() -> bool:

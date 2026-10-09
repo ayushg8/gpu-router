@@ -2190,3 +2190,36 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   ~5 s after bootstrap at load 139. Tests: `tests/api/test_daemon_units.py` (plist +
   bootstrap retry), `tests/unit/doctor/test_checks.py::test_launchd_agent_at_background_
   priority_is_a_warning`.
+- **D63** (colab offline is not a login problem, found live 2026-10-08) In 37 hours on the
+  D62 daemon (56 wakes) colab went `auth_required` four times ("no valid Google
+  application-default credentials": `gpu providers` said "login needed", routing said colab
+  needs a login) in the same second kaggle failed with NameResolutionError, and stayed so for
+  6 to 45 minutes until the network was back.
+  The colab CLI reports a credential refresh that cannot reach Google exactly like an expired
+  sign-in: "No valid default credentials found", exit 0 for `sessions` (reproduced with an
+  unreachable proxy). `colab.cli.google_reachable()` connects to oauth2.googleapis.com:443
+  (4 s in all, on a thread because getaddrinfo ignores socket timeouts, a hang = unreachable;
+  IPv4 addresses first, at most 4, so a dead IPv6 route does not hide a working IPv4; True
+  when `requests` would use a proxy for that host: env vars or the macOS System Settings
+  proxy via `urllib.request.getproxies`, minus NO_PROXY / the bypass list);
+  `classify(..., reachable=)` turns an auth-looking failure into Unavailable ("could not
+  refresh the Google sign-in: oauth2.googleapis.com is unreachable, so the network looks
+  down", hint "if the network is fine, the sign-in expired; run: gcloud ...") when its text
+  also carries a network signature or Google is unreachable, and the adapter passes it on
+  every classify call (`ColabAdapter._classify`) and in the healthcheck. A missing scope is still
+  AuthRequired (that answer came from the server). From `colab new` the outage is now
+  ambiguous rather than a definitive refusal (the name is stopped, as for other unclear
+  failures; independent review: record ABANDONED, `lookup_by_key` None, the next attempt
+  submits normally). Kaggle and Lightning already classified the same outage as unavailable.
+  Not done: reading the CLI's own colab.log for the refresh error (other calls write it
+  concurrently and it holds proxy tokens, D37); doctor's `colab whoami` row still calls an
+  outage "whoami failed" (a warning). Tests:
+  `tests/unit/providers/colab/test_offline_auth.py`; the colab conftest stubs the probe to
+  True so no test touches the network. Verified live: the probe answers True in 0.03-0.14 s
+  with the network up and False in 2 ms for an unresolvable host; the real CLI's offline output is
+  Unavailable with Google unreachable and AuthRequired with it reachable.
+  Also (found by this PR's CI): pgup/pgdn in the shell scroll with `immediate=True`;
+  Textual otherwise defers `scroll_to` until a refresh, and on CI runners the /logs block
+  sometimes had not moved 5 s after the key (`test_pageup_scrolls_the_newest_log_first`,
+  which now waits for conditions instead of fixed pauses and reports the scroll state when
+  it fails).

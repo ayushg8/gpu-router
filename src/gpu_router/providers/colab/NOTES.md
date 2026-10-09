@@ -222,6 +222,12 @@ Code: `providers/colab/{adapter,cli,remote,state}.py`; registry entry point
 - `colab sessions` with an EMPTY local store swallows auth failures: stderr "No valid
   default credentials found", stdout "No active sessions found on server.", exit 0. The
   healthcheck looks for that stderr line.
+- The CLI prints the same "No valid default credentials found" when the credential refresh
+  cannot reach Google at all (no network after a wake; reproduced 2026-10-08 with an
+  unreachable proxy: exit 0, no network error in the text). So every auth-looking failure is
+  checked against `cli.google_reachable()` (a 4 s connection to oauth2.googleapis.com:443,
+  on a thread, IPv4 first; True when `requests` would use a proxy, incl. the System Settings
+  one): unreachable = Unavailable "the network looks down", not AuthRequired (D63).
 - `colab stop -s NAME` for a name not in the store prints "Session 'NAME' not found." and
   exits 0. If the VM is already gone, `unassign` raises (traceback, exit 1) after the
   keep-alive was killed; the adapter treats a 404 there as stopped.
