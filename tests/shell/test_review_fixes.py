@@ -383,8 +383,7 @@ async def test_pageup_scrolls_the_newest_log_first(no_daemon: Path) -> None:
         await app.transcript.mount(block)
         block.write(view, [Text(f"Traceback line {n}") for n in range(43)])
         out = block.output
-        # Textual scrolls after the next refresh (scroll_to without immediate=True): fixed
-        # pauses read too early on a slow CI runner (2026-10-09: "33 < 33"), so wait.
+        # fixed pauses read too early on a slow CI runner (2026-10-09: "33 < 33"), so wait
         await settle(
             pilot,
             lambda: out.max_scroll_y > 0 and out.scroll_y == out.max_scroll_y,
@@ -392,8 +391,24 @@ async def test_pageup_scrolls_the_newest_log_first(no_daemon: Path) -> None:
             what="the log to render and follow its end",
         )
         top = out.scroll_y
+        calls: list[tuple[int, bool]] = []
+        real_scroll_page = block.scroll_page
+
+        def spy(direction: int) -> bool:
+            calls.append((direction, real_scroll_page(direction)))
+            return calls[-1][1]
+
+        block.scroll_page = spy  # type: ignore[method-assign]
         await pilot.press("pageup")
-        await settle(pilot, lambda: out.scroll_y < top, timeout_s=5, what="pgup to scroll")
+        try:
+            await settle(pilot, lambda: out.scroll_y < top, timeout_s=5, what="pgup to scroll")
+        except AssertionError as exc:
+            state = (
+                f"scroll_page calls {calls}, y {out.scroll_y} of {out.max_scroll_y}, "
+                f"height {out.size.height}, focused {app.focused!r}, "
+                f"{len(app.query(LogsBlock))} logs blocks"
+            )
+            raise AssertionError(f"{exc}: {state}") from None
         from gpu_router.shell.widgets import _plain
 
         words = " ".join(_plain(cmds.help_renderable()).split())

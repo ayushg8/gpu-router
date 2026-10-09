@@ -428,7 +428,9 @@ class LogsBlock(LiveBlock):
         if direction > 0 and out.scroll_y >= out.max_scroll_y:
             return False
         page = max(1, out.size.height - 1)
-        out.scroll_relative(y=direction * page, animate=False)
+        # immediate: a key press scrolls now, not after a refresh that a busy screen can
+        # keep putting off (Textual defers scroll_to without it; seen on CI, 2026-10-09)
+        out.scroll_relative(y=direction * page, animate=False, immediate=True)
         return True
 
     def forget_output(self) -> None:

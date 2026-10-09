@@ -403,7 +403,7 @@ class GpuShell(App[int]):
         if logs and logs[-1].scroll_page(direction):
             return
         page = max(1, self.transcript.size.height - 2)
-        self.transcript.scroll_relative(y=direction * page, animate=False)
+        self.transcript.scroll_relative(y=direction * page, animate=False, immediate=True)
 
     def action_clear_screen(self) -> None:
         self.clear_transcript_now()
