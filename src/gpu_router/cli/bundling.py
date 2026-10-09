@@ -13,6 +13,7 @@ packaging layer is missing, `preview` returns None and the dry run shows only th
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from typing import Any
 
 from gpu_router.models import JobSpec
@@ -61,8 +62,10 @@ def preview(spec: JobSpec) -> dict[str, Any] | None:
     }
     sel = getattr(bundle, "selection", None)
     if sel is not None:
-        from gpu_router.packaging.bundle import left_out_view
+        from gpu_router.packaging.bundle import arg_warnings, left_out_view
 
+        # arguments naming paths the job will not find (not in the manifest's warnings)
+        out["warnings"][:0] = arg_warnings(spec, sel, Path(spec.project_dir).resolve())
         if spec.include:
             out["included"] = {"files": len(sel.included), "bytes": sel.included_bytes}
         data_paths = [d.path for d in spec.data if d.path]

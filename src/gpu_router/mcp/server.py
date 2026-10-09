@@ -181,7 +181,8 @@ Script = Annotated[
     Field(
         description="Script to run, relative to project_dir (e.g. train.py or "
         "scripts/train.py). Omit to use gpu.yaml's `script`. A non-.py value runs as a "
-        "command, e.g. bash."
+        "command line, split like a shell would, e.g. `bash jobs/run.sh`. Paths in it and in "
+        "args are relative to project_dir and must ship (see bundle.warnings)."
     ),
 ]
 Args = Annotated[

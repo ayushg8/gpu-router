@@ -2223,3 +2223,25 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   sometimes had not moved 5 s after the key (`test_pageup_scrolls_the_newest_log_first`,
   which now waits for conditions instead of fixed pauses and reports the scroll state when
   it fails).
+- **D64** (agent entrypoints and argument paths, from real agent jobs 2026-10-08) (1) Job ca1e
+  sent `script="bash /<path>/build.sh"` through gpu_submit (whose description said "a
+  non-.py value runs as a command"); `jobspec._entrypoint` kept it as the one-word command
+  `["bash /<path>/build.sh"]`, the runner exec'd a program of that name: exit 127. A script
+  containing whitespace that names no existing file is now split with `shlex` (`train.py
+  --epochs 3` = script + args, `bash 'my run.sh'` = command; a file whose name has a space
+  stays one word; an unbalanced quote is InvalidSpec with a hint). `_entrypoint` returns
+  the script's args with it. (2) Job 6124 passed `--list experiments/math/out/list.txt`, a
+  git-ignored file, and failed with FileNotFoundError on the GPU; its retry passed absolute
+  paths on this Mac (works only on local). `packaging.bundle.arg_warnings` names arguments
+  (incl. `--flag=value`, command words after the program) that exist now and either do not
+  ship (git-ignored: include=/data= fix), are absolute paths inside the project (pass the
+  relative one), or are outside the project (data= or move it); paths passed as data= and
+  missing paths (outputs) say nothing; at most 3, fix first (a long path is cut at
+  SUMMARY_WARNING_CHARS). They go first in gpu_submit / gpu_route `bundle.warnings` (before
+  the untracked-file list) and in `gpu run --dry-run`, never in the manifest (its hash must
+  not depend on files outside the project). The gpu_submit `script` description says a
+  command line is split and paths must ship. Tests: `tests/unit/cli/test_entry_split.py`,
+  `tests/unit/packaging/test_arg_paths.py`. Verified live: `gpu run --dry-run` and an
+  in-process MCP `gpu_route` against the running daemon on the field-test project (split
+  argv, the data/rows warning). Of the other jobs that day, 3d81 (exit 2) was the script's
+  own error; 11 of 15 jobs since 03:00 UTC were done (5 local, 3 kaggle, 3 colab).

@@ -139,6 +139,70 @@ def _entry_warnings(spec: JobSpec, sel: FileSelection, project: Path) -> list[st
     return [f"{spec.script} is not in the project; the job will fail to start"]
 
 
+#: At most this many argument warnings per summary (the summary keeps SUMMARY_WARNINGS).
+ARG_WARNINGS = 3
+
+
+def arg_warnings(spec: JobSpec, sel: FileSelection, project: Path) -> list[str]:
+    """Arguments that name a path the job will not find: a git-ignored project path (job
+    6124, 2026-10-08: `--list experiments/math/out/list.txt` failed with FileNotFoundError on
+    the GPU) or a path on this Mac (its retry passed absolute paths, which only a run on this
+    Mac can see). Only paths that exist now are named; summary only (never the manifest: its
+    hash must not depend on files outside the project)."""
+    shipped = {f.rel for f in sel.files}
+    data = [
+        (Path(d.path) if os.path.isabs(d.path) else project / d.path).resolve()
+        for d in spec.data
+        if d.path
+    ]
+    argv = [*(spec.command[1:] if spec.command else []), *spec.args]
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in argv:
+        value = raw.split("=", 1)[1] if raw.startswith("-") and "=" in raw else raw
+        if not value or value.startswith(("-", "~")) or "://" in value or len(value) > 1024:
+            continue
+        if value in seen or "\n" in value or "\x00" in value:
+            continue
+        seen.add(value)
+        target = Path(value) if os.path.isabs(value) else project / value
+        try:
+            if not target.exists():
+                continue
+            resolved = target.resolve()
+        except OSError:
+            continue
+        if any(resolved == d or d in resolved.parents for d in data):
+            continue  # passed as data=: the job reads it under gpu.data_dir()
+        try:
+            rel = resolved.relative_to(project).as_posix()
+        except ValueError:
+            out.append(  # the fix first: a long path may be cut at SUMMARY_WARNING_CHARS
+                "pass it as data= or move it into the project: an argument outside the "
+                f"project is on this Mac only, so a remote run cannot read it: {value}"
+            )
+            continue
+        ships = (
+            rel in shipped if resolved.is_file() else any(f.startswith(rel + "/") for f in shipped)
+        )
+        if os.path.isabs(value):
+            out.append(
+                f"pass {rel} (relative to the project)"
+                + ("" if ships else f' and add include=["{rel}"]')
+                + " instead of an absolute path on this Mac: the job runs from a copy of the "
+                f"project, which a remote run has elsewhere: {value}"
+            )
+        elif not ships:
+            out.append(
+                f"argument {value}: git ignores it, so the job's copy of the project lacks it; "
+                f'to read it, add include=["{rel}"] or pass it as data= (results come back '
+                "only from gpu.output_dir())"
+            )
+        if len(out) >= ARG_WARNINGS:
+            break
+    return out
+
+
 def build_manifest(
     spec: JobSpec,
     sel: FileSelection,
@@ -396,7 +460,8 @@ def bundle_summary(spec: JobSpec, *, max_mb: float = DEFAULT_MAX_BUNDLE_MB) -> d
         out["included"] = {"files": len(sel.included), "bytes": sel.included_bytes}
     data_paths = [d.path for d in spec.data if d.path]
     out.update(left_out_view(project, sel, spec.include, data_paths))
-    warnings = [*sel.warnings, *_entry_warnings(spec, sel, project.resolve())]
+    root = project.resolve()
+    warnings = [*_entry_warnings(spec, sel, root), *arg_warnings(spec, sel, root), *sel.warnings]
     if sel.total_bytes > max_mb * _MB:
         why = (
             f"`include:` adds {human_bytes(sel.included_bytes)}: narrow it, and pass datasets "
