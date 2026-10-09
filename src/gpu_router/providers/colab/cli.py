@@ -24,10 +24,15 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import threading
+import time
+import urllib.request
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from gpu_router.errors import (
     AdapterError,
@@ -275,6 +280,68 @@ _RATE = (
 )
 #: Session names we chose (`gr-...`): blanked before matching failure signatures.
 _OUR_NAMES = re.compile(r"\bgr-[A-Za-z0-9_-]{1,62}")
+#: Google's token endpoint, where the CLI refreshes application-default credentials.
+GOOGLE_TOKEN_HOST = ("oauth2.googleapis.com", 443)
+REACH_TIMEOUT_S = 4.0
+#: Addresses tried per probe (IPv4 first: a dead IPv6 route must not hide a working IPv4).
+REACH_MAX_ADDRS = 4
+_AddrInfo = tuple[socket.AddressFamily, socket.SocketKind, int, str, Any]
+
+
+def _behind_proxy(host: str) -> bool:
+    """Whether `requests` (the CLI's HTTP stack) would go through a proxy for `host`: env
+    vars, and on macOS the System Settings proxy (`urllib.request.getproxies`), minus
+    NO_PROXY / the bypass list."""
+    proxies = urllib.request.getproxies()
+    if not (proxies.get("https") or proxies.get("all")):
+        return False
+    return not urllib.request.proxy_bypass(host)
+
+
+def connect_order(infos: Sequence[_AddrInfo]) -> list[_AddrInfo]:
+    """getaddrinfo results to try: IPv4 first (stable), at most REACH_MAX_ADDRS."""
+    return sorted(infos, key=lambda info: info[0] != socket.AF_INET)[:REACH_MAX_ADDRS]
+
+
+def google_reachable(timeout: float = REACH_TIMEOUT_S) -> bool:
+    """Whether this Mac can open a connection to Google's token endpoint. The colab CLI
+    reports a failed credential refresh as "No valid default credentials found" whether the
+    sign-in expired or the network is down (it even exits 0 for `sessions`; reproduced with
+    an unreachable proxy, 2026-10-08, after the daemon marked colab "login needed" on wakes
+    with no network), so an auth-looking failure is a login problem only while Google
+    answers. Runs on a thread because getaddrinfo ignores socket timeouts; a hang counts as
+    unreachable. Behind a proxy a direct connection proves nothing: True."""
+    host, port = GOOGLE_TOKEN_HOST
+    if _behind_proxy(host):
+        return True
+    answer: list[bool] = []
+
+    def probe() -> None:
+        deadline = time.monotonic() + timeout
+        try:
+            infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError:
+            answer.append(False)
+            return
+        infos = connect_order(infos)
+        for n, (family, kind, proto, _name, addr) in enumerate(infos):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            try:
+                with socket.socket(family, kind, proto) as sock:
+                    sock.settimeout(max(0.5, left / (len(infos) - n)))
+                    sock.connect(addr)
+            except OSError:
+                continue
+            answer.append(True)
+            return
+        answer.append(False)
+
+    worker = threading.Thread(target=probe, name="colab-reach", daemon=True)
+    worker.start()
+    worker.join(timeout + 1.0)
+    return bool(answer) and answer[0]
 
 
 def session_gone(res: CliResult) -> bool:
@@ -290,6 +357,7 @@ def classify(
     gpu: str | None = None,
     now: float | None = None,
     quota_reset_s: float = 24 * 3600,
+    reachable: Callable[[], bool] | None = None,
 ) -> AdapterError:
     """Map a failed CLI call to the adapter taxonomy (A3). Callers check `session_gone`
     first where a vanished session has its own meaning (status -> lost, cancel -> done).
@@ -300,7 +368,8 @@ def classify(
     - 412 ("Allocation refused (precondition failed)"): Unavailable. It means too many
       active sessions (another tool may hold the account's one free GPU) or a temporary
       capacity limit.
-    - missing scope / no or expired ADC / missing CLI: AuthRequired with the fix as hint.
+    - missing scope / no or expired ADC / missing CLI: AuthRequired with the fix as hint;
+      ADC trouble while `reachable()` says Google cannot be reached is Unavailable.
     - 429-style throttling: RateLimited. Network trouble, timeouts, anything else:
       Unavailable (transient; the engine backs off).
     """
@@ -336,6 +405,13 @@ def classify(
             hint=ADC_HINT,
         )
     if any(s in text for s in _AUTH):
+        if any(s in text for s in _NETWORK) or (reachable is not None and not reachable()):
+            return Unavailable(
+                f"{what} could not refresh the Google sign-in: oauth2.googleapis.com is "
+                "unreachable, so the network looks down (the login itself may be fine)",
+                provider=provider,
+                hint=f"if the network is fine, the sign-in expired; {ADC_HINT}",
+            )
         return AuthRequired(
             f"{what}: Google application-default credentials are missing or expired",
             provider=provider,

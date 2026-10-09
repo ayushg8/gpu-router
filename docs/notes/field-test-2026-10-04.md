@@ -177,6 +177,15 @@ re-installed agent answered ready ~5 s after bootstrap at load 139. `gpu daemon
 install-launchd` also retries the bootstrap while launchd still tears down the old daemon
 (it had answered error 5 and left the agent unloaded).
 
+### Colab said "login needed" whenever the network dropped (2026-10-08, D63)
+
+37 hours on the new daemon: healthy through 56 wakes from sleep. But four times colab went
+`ok -> auth_required` in the same second kaggle failed with `NameResolutionError`, and read
+"login needed" for 6 to 45 minutes, until the network was back. The colab CLI prints "No valid
+default credentials found" (exit 0) when the credential refresh cannot reach Google, the same
+text as an expired sign-in. An auth-looking colab failure now counts as a login problem only
+while oauth2.googleapis.com answers; otherwise it is an outage ("the network looks down").
+
 ## Still open
 
 - **Lightning needs a fresh sign-in by the user**: `gpu login lightning --browser` (or

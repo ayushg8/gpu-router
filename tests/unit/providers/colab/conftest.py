@@ -10,6 +10,7 @@ import pytest
 from gpu_router.clock import SystemClock
 from gpu_router.paths import Paths
 from gpu_router.providers.colab import adapter as colab_mod
+from gpu_router.providers.colab import cli as colab_cli
 from gpu_router.providers.colab.adapter import ColabAdapter
 from tests.unit.providers.colab.helpers import ColabSim, make_adapter
 
@@ -18,6 +19,12 @@ from tests.unit.providers.colab.helpers import ColabSim, make_adapter
 def _no_janitor(monkeypatch: pytest.MonkeyPatch) -> None:
     """The janitor thread (D36) outlives a test; only the tests about it switch it on."""
     monkeypatch.setattr(colab_mod, "JANITOR_ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
+def _google_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test probes the real network; the offline tests switch this to False."""
+    monkeypatch.setattr(colab_cli, "google_reachable", lambda *a, **k: True)
 
 
 @pytest.fixture
