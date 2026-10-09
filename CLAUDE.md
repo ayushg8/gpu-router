@@ -2218,3 +2218,8 @@ mypy are clean. All met at integration (2026-09-23): 651 passed, `-m crash` 10 p
   True so no test touches the network. Verified live: the probe answers True in 0.03-0.14 s
   with the network up and False in 2 ms for an unresolvable host; the real CLI's offline output is
   Unavailable with Google unreachable and AuthRequired with it reachable.
+  Also (found by this PR's CI): pgup/pgdn in the shell scroll with `immediate=True`;
+  Textual otherwise defers `scroll_to` until a refresh, and on CI runners the /logs block
+  sometimes had not moved 5 s after the key (`test_pageup_scrolls_the_newest_log_first`,
+  which now waits for conditions instead of fixed pauses and reports the scroll state when
+  it fails).
