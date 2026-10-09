@@ -382,12 +382,18 @@ async def test_pageup_scrolls_the_newest_log_first(no_daemon: Path) -> None:
         block.max_rows = 10
         await app.transcript.mount(block)
         block.write(view, [Text(f"Traceback line {n}") for n in range(43)])
-        await pilot.pause(0.2)
-        assert block.output.max_scroll_y > 0
-        top = block.output.scroll_y
+        out = block.output
+        # Textual scrolls after the next refresh (scroll_to without immediate=True): fixed
+        # pauses read too early on a slow CI runner (2026-10-09: "33 < 33"), so wait.
+        await settle(
+            pilot,
+            lambda: out.max_scroll_y > 0 and out.scroll_y == out.max_scroll_y,
+            timeout_s=5,
+            what="the log to render and follow its end",
+        )
+        top = out.scroll_y
         await pilot.press("pageup")
-        await pilot.pause(0.1)
-        assert block.output.scroll_y < top
+        await settle(pilot, lambda: out.scroll_y < top, timeout_s=5, what="pgup to scroll")
         from gpu_router.shell.widgets import _plain
 
         words = " ".join(_plain(cmds.help_renderable()).split())
